@@ -1,0 +1,10 @@
+# SafePay Backend
+fastapi[all]
+uvicorn[standard]
+SQLAlchemy>=2.0
+pydantic>=2.0
+pydantic-settings
+passlib[bcrypt]
+python-jose[cryptography]
+python-multipart
+requests>=2.28
