@@ -1,3 +1,5 @@
+import time
+from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
@@ -83,10 +85,52 @@ def register(user_in: UserCreate, db: Session = Depends(get_db)):
 
 @router.post("/login", response_model=AuthResponse)
 def login(data: UserLogin, db: Session = Depends(get_db)):
-    key = data.email_or_phone
+    key = data.email_or_phone.lower().strip() if data.email_or_phone else ""
     user = db.query(User).filter((User.email == key) | (User.phone == key)).first()
-    if not user or not verify_password(data.password, user.hashed_password):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    # Vague generic error message for all login failures (security rule #4)
+    generic_error = "Invalid login credentials"
+
+    if not user:
+        # Uniform delay to prevent timing attacks/enumeration
+        time.sleep(0.3)
+        raise HTTPException(status_code=401, detail=generic_error)
+
+    # Check if account is currently locked out
+    now = datetime.utcnow()
+    if user.locked_until and user.locked_until > now:
+        # Don't explicitly reveal "account locked" to prevent account enumeration
+        # Introduce delay to slow down attackers
+        time.sleep(1.0)
+        raise HTTPException(status_code=401, detail=generic_error)
+
+    # If lock duration expired, reset attempts
+    if user.locked_until and user.locked_until <= now:
+        user.locked_until = None
+        user.failed_attempts = 0
+
+    # Progressive delay based on current failed attempts (1s, 2s, 3s...)
+    attempts = user.failed_attempts or 0
+    if attempts > 0:
+        delay = min(attempts * 0.5, 3.0)
+        time.sleep(delay)
+
+    # Verify password
+    if not verify_password(data.password, user.hashed_password):
+        user.failed_attempts = (user.failed_attempts or 0) + 1
+        
+        # Lock account after 5 consecutive failed attempts for 15 minutes
+        if user.failed_attempts >= 5:
+            user.locked_until = now + timedelta(minutes=15)
+            
+        db.commit()
+        raise HTTPException(status_code=401, detail=generic_error)
+
+    # On successful login: reset failed attempts & lock state
+    user.failed_attempts = 0
+    user.locked_until = None
+    db.commit()
+
     token = create_access_token(data={"sub": str(user.id)})
     return {"access_token": token, "token_type": "bearer", "user": _profile_dict(user)}
 

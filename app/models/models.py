@@ -37,6 +37,8 @@ class User(Base):
     badge_tier = Column(String, default="none")  # none, verified, trusted, top_dealer
     total_deals = Column(Integer, default=0)
     rating = Column(Float, default=5.0)
+    failed_attempts = Column(Integer, default=0)
+    locked_until = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     listings = relationship("Listing", backref="seller", foreign_keys="Listing.seller_id")

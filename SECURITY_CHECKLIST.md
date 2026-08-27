@@ -16,8 +16,9 @@
 8.  ✅ **Block field tampering** — Pydantic schemas validate input, is_admin not exposed
 9.  ⚠️ **Secure session cookies** — Using JWT bearer tokens (no cookies), secure storage on device
 10. ✅ **Hash passwords** — bcrypt via passlib
-11. ✅ **Rate limit login** — 5 attempts/60s per IP on auth endpoints, 60 req/60s general
-12. ⚠️ **Bot protection** — Rate limiting helps; CAPTCHA not yet implemented (needs frontend)
+11. ✅ **Rate limit & Account Lockout** — 5 attempts/60s per IP, 5 failed attempts locks account for 15 mins with progressive delay (0.5s-3s)
+12. ⚠️ **Bot protection** — Rate limiting + progressive delays stop automated brute-forcing; CAPTCHA optional
+13. ✅ **Generic Error Messages** — Vague "Invalid login credentials" message used for invalid pass, missing user, and locked account to prevent account enumeration
 13. ✅ **Parameterize queries** — SQLAlchemy ORM used everywhere (no raw SQL)
 14. ✅ **Validate all input** — Pydantic schemas + sanitize_text() on all user inputs
 15. ✅ **Escape user content** — html.escape() + tag stripping in sanitize_text()
