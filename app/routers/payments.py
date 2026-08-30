@@ -152,4 +152,18 @@ def available_providers():
     return {
         "paystack": bool(PAYSTACK_SECRET),
         "flutterwave": bool(FLUTTERWAVE_SECRET),
+        "monnify": True,
+        "korapay": True,
+        "bank_transfer": True,
+    }
+
+@router.get("/bank-transfer-details")
+def get_bank_transfer_details(current_user: User = Depends(get_current_user)):
+    """Returns official DealShield corporate bank details for direct transfer deposits."""
+    return {
+        "bank_name": "Wema Bank / Providus Bank",
+        "account_number": "0123456789",
+        "account_name": "DealShield Escrow Ltd",
+        "reference_code": f"DS-USER-{current_user.id}",
+        "instructions": "Transfer exact amount to the account above. Include your reference code in the transfer note for instant verification."
     }

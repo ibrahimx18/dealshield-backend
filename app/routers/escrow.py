@@ -58,7 +58,22 @@ def create_escrow(escrow_in: EscrowCreate, current_user: User = Depends(get_curr
         raise HTTPException(status_code=400, detail=f"Insufficient wallet balance. Need ₦{total:,.0f} (item + insurance). Please deposit funds first.")
 
     current_user.wallet_balance -= total
-    commission = round(listing.price * settings.COMMISSION_RATE, 2)
+    
+    # Calculate commission: ₦10 per bag for cement, or capped tiered fee for other categories
+    if listing.category == "cement":
+        bag_count = escrow_in.bag_count or 600  # Default to 600 bags (1 truck) if not specified
+        commission = float(bag_count * 10)  # ₦10 per bag
+    else:
+        # Tiered fee: Under 500k=1.5%, 500k-5M=1%, 5M-20M=0.5%, >20M=100k cap
+        price = listing.price
+        if price < 500000:
+            commission = round(price * 0.015, 2)
+        elif price < 5000000:
+            commission = round(price * 0.010, 2)
+        elif price < 20000000:
+            commission = round(price * 0.005, 2)
+        else:
+            commission = 100000.0  # Max cap ₦100k
 
     tx = EscrowTransaction(
         listing_id=listing.id,

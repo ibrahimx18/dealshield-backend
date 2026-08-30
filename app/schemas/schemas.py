@@ -64,6 +64,7 @@ class ListingListResponse(BaseModel):
 class EscrowCreate(BaseModel):
     listing_id: Any
     insured: bool = False
+    bag_count: Optional[int] = None  # For cement category (600, 900 bags etc.)
 
 class EscrowShip(BaseModel):
     logistics_provider: str = ""

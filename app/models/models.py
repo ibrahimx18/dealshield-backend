@@ -10,6 +10,9 @@ class CommodityCategory(str, enum.Enum):
     dollars = "dollars"
     oil = "oil"
     land = "land"
+    cement = "cement"
+    crypto = "crypto"
+    giftcards = "giftcards"
 
 class EscrowStatus(str, enum.Enum):
     pending = "pending"
