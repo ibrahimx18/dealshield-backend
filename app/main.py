@@ -1,5 +1,6 @@
 import os
 import uvicorn
+from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.database import Base, engine, SessionLocal
@@ -9,6 +10,9 @@ from app.core.security_middleware import (
     RateLimitMiddleware,
 )
 from app.routers import auth, listings, escrow, wallet, market, health, integrations, ai, reviews, payment_links, payments, dispatch, admin
+
+# Load .env file into os.environ BEFORE secret validation
+load_dotenv()
 
 
 # ── Startup secrets validation (audit finding C1/C2) ──
