@@ -10,6 +10,41 @@ from app.core.security_middleware import (
 )
 from app.routers import auth, listings, escrow, wallet, market, health, integrations, ai, reviews, payment_links, payments, dispatch
 
+
+# ── Startup secrets validation (audit finding C1/C2) ──
+# Old insecure defaults that must never be used in any deployed environment.
+_OLD_INSECURE_DEFAULTS = {
+    "SAFEPAY_SECRET_KEY": "CHANGE-ME-IN-PRODUCTION-use-a-32-char-random-string",
+    "SAFEPAY_WEBHOOK_SECRET": "safepay-n8n-2026",
+    "BOT_TOKEN": "safepay_bot_secret_2026",
+}
+
+
+def validate_required_secrets():
+    """Fail fast at startup if any required secret is missing or still set to
+    one of the old hardcoded fallback values. Prevents accidentally running
+    with the insecure defaults that used to be baked into the source code.
+
+    Generate a strong value with:
+        python -c "import secrets; print(secrets.token_urlsafe(32))"
+    """
+    missing_or_insecure = []
+    for var_name, old_default in _OLD_INSECURE_DEFAULTS.items():
+        value = os.getenv(var_name, "")
+        if not value or value == old_default:
+            missing_or_insecure.append(var_name)
+    if missing_or_insecure:
+        raise RuntimeError(
+            "Refusing to start: the following required secrets are unset or still "
+            "equal to insecure defaults removed from source control: "
+            f"{', '.join(missing_or_insecure)}. Set them as environment variables "
+            "(see .env.example) with values generated via: "
+            "python -c \"import secrets; print(secrets.token_urlsafe(32))\""
+        )
+
+
+validate_required_secrets()
+
 Base.metadata.create_all(bind=engine)
 
 # ── Seed demo data ──

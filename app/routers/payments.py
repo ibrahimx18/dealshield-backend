@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 import requests
 from app.dependencies import get_db
 from app.schemas.schemas import InitializePayment, VerifyPayment, PaymentResponse
-from app.models.models import User, WalletTx
+from app.models.models import User, WalletTx, PaymentReference
 from app.routers.auth import get_current_user
 
 router = APIRouter()
@@ -37,6 +37,17 @@ def initialize_payment(pay_in: InitializePayment, current_user: User = Depends(g
 
     # Amount in kobo for Paystack, or naira for Flutterwave
     reference = f"SFP_{secrets.token_urlsafe(8)}"
+
+    # Audit C3: persist the reference up-front so /verify can only ever
+    # consume a reference that this user actually initialized, exactly once.
+    db.add(PaymentReference(
+        reference=reference,
+        user_id=current_user.id,
+        amount=pay_in.amount,
+        provider=pay_in.provider,
+        status="pending",
+    ))
+    db.commit()
 
     if pay_in.provider == "paystack":
         if not PAYSTACK_SECRET:
@@ -95,9 +106,45 @@ def initialize_payment(pay_in: InitializePayment, current_user: User = Depends(g
         raise HTTPException(status_code=400, detail="Provider must be 'paystack' or 'flutterwave'")
 
 
+def _claim_payment_reference(db: Session, reference: str, current_user: User) -> PaymentReference:
+    """Audit C3: enforce that a payment reference belongs to the calling user,
+    is still 'pending', and atomically flip it to 'consumed' before any wallet
+    credit happens. Returns the claimed PaymentReference row.
+
+    Raises HTTPException(404) if the reference doesn't belong to this user,
+    or HTTPException(409) if it has already been consumed (double-verify /
+    replay attempt) or was claimed concurrently.
+    """
+    pay_ref = db.query(PaymentReference).filter(
+        PaymentReference.reference == reference,
+        PaymentReference.user_id == current_user.id,
+    ).first()
+    if not pay_ref:
+        raise HTTPException(status_code=404, detail="Payment reference not found for this user")
+    if pay_ref.status != "pending":
+        raise HTTPException(status_code=409, detail="Payment reference already consumed")
+
+    # Atomic conditional update — only one concurrent /verify call can win.
+    rows = db.query(PaymentReference).filter(
+        PaymentReference.id == pay_ref.id,
+        PaymentReference.status == "pending",
+    ).update({"status": "consumed"}, synchronize_session=False)
+    db.flush()
+    if rows != 1:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Payment reference already consumed")
+    db.refresh(pay_ref)
+    return pay_ref
+
+
 @router.post("/verify", response_model=dict)
 def verify_payment(verify_in: VerifyPayment, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Verify a completed payment and credit wallet if successful."""
+    """Verify a completed payment and credit wallet if successful.
+
+    Audit C3: the reference must belong to the calling user and be 'pending';
+    it is atomically marked 'consumed' BEFORE crediting the wallet, so a
+    replayed/duplicate verify call cannot credit the wallet twice.
+    """
     if verify_in.provider == "paystack":
         headers = {"Authorization": f"Bearer {PAYSTACK_SECRET}"}
         try:
@@ -105,6 +152,7 @@ def verify_payment(verify_in: VerifyPayment, current_user: User = Depends(get_cu
             resp.raise_for_status()
             data = resp.json()
             if data["data"]["status"] == "success":
+                _claim_payment_reference(db, verify_in.reference, current_user)
                 amount = data["data"]["amount"] / 100  # kobo → naira
                 current_user.wallet_balance += amount
                 db.add(WalletTx(
@@ -117,6 +165,8 @@ def verify_payment(verify_in: VerifyPayment, current_user: User = Depends(get_cu
                 return {"status": "success", "amount": amount, "new_balance": current_user.wallet_balance}
             else:
                 return {"status": "failed", "detail": data["data"]["status"]}
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"Paystack verify failed: {e}")
 
@@ -127,6 +177,7 @@ def verify_payment(verify_in: VerifyPayment, current_user: User = Depends(get_cu
             resp.raise_for_status()
             data = resp.json()
             if data["data"]["status"] == "successful":
+                _claim_payment_reference(db, verify_in.reference, current_user)
                 amount = float(data["data"]["amount"])
                 current_user.wallet_balance += amount
                 db.add(WalletTx(
@@ -139,6 +190,8 @@ def verify_payment(verify_in: VerifyPayment, current_user: User = Depends(get_cu
                 return {"status": "success", "amount": amount, "new_balance": current_user.wallet_balance}
             else:
                 return {"status": "failed", "detail": data["data"]["status"]}
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"Flutterwave verify failed: {e}")
 

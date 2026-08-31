@@ -140,11 +140,28 @@ def confirm_receipt(tx_id: int, current_user: User = Depends(get_current_user), 
         raise HTTPException(status_code=403, detail="Only buyer can confirm receipt")
     if tx.status != "shipped":
         raise HTTPException(status_code=400, detail="Can only confirm after shipping")
-    # Release funds to seller (amount - commission)
+
+    # Atomic conditional update — prevents double-release race (audit C4).
+    # This is a read-check-mutate replaced with a single UPDATE ... WHERE
+    # status = 'shipped' so only one concurrent request can win the row.
+    # NOTE: SQLite is dev-only; under Postgres with concurrent writers this
+    # rowcount guard is still correct (it's a single atomic UPDATE statement),
+    # but for stronger isolation consider SELECT ... FOR UPDATE as well.
+    completed_at = datetime.utcnow()
+    rows = db.query(EscrowTransaction).filter(
+        EscrowTransaction.id == tx_id,
+        EscrowTransaction.status == "shipped",
+    ).update({"status": "delivered", "completed_at": completed_at}, synchronize_session=False)
+    db.flush()
+    if rows != 1:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Transaction status changed concurrently; refusing to double-release funds")
+    db.refresh(tx)
+
+    # Release funds to seller (amount - commission) — only reached once the
+    # conditional update above has claimed the row exactly once.
     seller = db.query(User).filter(User.id == tx.seller_id).first()
     seller.wallet_balance += tx.amount - tx.commission
-    tx.status = "delivered"
-    tx.completed_at = datetime.utcnow()
     seller.total_deals += 1
     buyer = db.query(User).filter(User.id == tx.buyer_id).first()
     buyer.total_deals += 1
@@ -183,12 +200,25 @@ def cancel(tx_id: int, current_user: User = Depends(get_current_user), db: Sessi
         raise HTTPException(status_code=403, detail="Not authorized")
     if tx.status in ("shipped", "delivered", "disputed"):
         raise HTTPException(status_code=400, detail="Cannot cancel at this stage")
-    # Refund buyer (item + insurance)
+
+    # Atomic conditional update — prevents double-refund race (audit C4).
+    # NOTE: SQLite is dev-only; see confirm_receipt() note re: Postgres locking.
+    completed_at = datetime.utcnow()
+    rows = db.query(EscrowTransaction).filter(
+        EscrowTransaction.id == tx_id,
+        EscrowTransaction.status == "funds_deposited",
+    ).update({"status": "cancelled", "completed_at": completed_at}, synchronize_session=False)
+    db.flush()
+    if rows != 1:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Transaction status changed concurrently; refusing to double-refund")
+    db.refresh(tx)
+
+    # Refund buyer (item + insurance) — only reached once the conditional
+    # update above has claimed the row exactly once.
     buyer = db.query(User).filter(User.id == tx.buyer_id).first()
     refund = tx.amount + (tx.insurance_fee or 0)
     buyer.wallet_balance += refund
-    tx.status = "cancelled"
-    tx.completed_at = datetime.utcnow()
     db.add(WalletTx(user_id=buyer.id, amount=refund, type="escrow_refund",
                     description=f"Escrow refund for {tx.listing_title}"))
     db.commit()

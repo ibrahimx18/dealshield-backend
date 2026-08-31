@@ -14,7 +14,8 @@ logger = logging.getLogger("safepay.notifications")
 # ── Configuration ──
 # n8n webhook base URL for SafePay events
 N8N_WEBHOOK_BASE = os.getenv("N8N_WEBHOOK_BASE", "http://localhost:5678/webhook")
-SAFEPAY_WEBHOOK_SECRET = os.getenv("SAFEPAY_WEBHOOK_SECRET", "safepay-n8n-2026")
+# No insecure fallback — app.main.validate_required_secrets() enforces this is set at startup.
+SAFEPAY_WEBHOOK_SECRET = os.getenv("SAFEPAY_WEBHOOK_SECRET", "")
 
 # Telegram bot token (for direct sends if n8n is down)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
