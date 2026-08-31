@@ -64,11 +64,23 @@ def confirm_pickup(tx_id: int, pickup: PickupConfirm, db: Session = Depends(get_
     if tx.rider_phone and tx.rider_phone != pickup.rider_phone:
         raise HTTPException(status_code=400, detail="Rider phone does not match")
 
-    tx.pickup_confirmed = True
-    tx.status = "delivered"
-    tx.completed_at = datetime.utcnow()
+    # Atomic conditional update — prevents double-release race (audit C4).
+    # Read-check-mutate replaced with a single UPDATE ... WHERE status = 'shipped'
+    # so only one concurrent confirm-pickup request can claim the row.
+    # NOTE: SQLite is dev-only; see escrow.py confirm_receipt() note re: Postgres locking.
+    completed_at = datetime.utcnow()
+    rows = db.query(EscrowTransaction).filter(
+        EscrowTransaction.id == tx_id,
+        EscrowTransaction.status == "shipped",
+    ).update({"status": "delivered", "completed_at": completed_at, "pickup_confirmed": True}, synchronize_session=False)
+    db.flush()
+    if rows != 1:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Transaction status changed concurrently; refusing to double-release funds")
+    db.refresh(tx)
 
-    # Release funds to seller
+    # Release funds to seller — only reached once the conditional update
+    # above has claimed the row exactly once.
     seller = db.query(User).filter(User.id == tx.seller_id).first()
     if seller:
         seller.wallet_balance += tx.amount - tx.commission
