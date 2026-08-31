@@ -15,7 +15,8 @@ from app.core.config import settings
 router = APIRouter()
 
 # Integration secret — n8n must pass this in X-SafePay-Secret header
-INTEGRATION_SECRET = os.getenv("SAFEPAY_WEBHOOK_SECRET", "safepay-n8n-2026")
+# No insecure fallback — app.main.validate_required_secrets() enforces this is set at startup.
+INTEGRATION_SECRET = os.getenv("SAFEPAY_WEBHOOK_SECRET", "")
 
 
 def verify_secret(x_safepay_secret: str = Header(None)):
