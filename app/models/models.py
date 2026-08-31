@@ -111,6 +111,21 @@ class WalletTx(Base):
     timestamp = Column(DateTime, default=datetime.utcnow)
 
 
+class PaymentReference(Base):
+    """Audit C3: tracks payment references created at /payments/initialize so
+    /payments/verify can only credit a wallet once per reference, and only
+    for the user who created it (prevents replay / idempotency abuse).
+    """
+    __tablename__ = "payment_references"
+    id = Column(Integer, primary_key=True, index=True)
+    reference = Column(String, unique=True, index=True, nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    amount = Column(Float, nullable=False)
+    provider = Column(String, nullable=False, default="")
+    status = Column(String, nullable=False, default="pending")  # pending -> consumed
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 class MarketPrice(Base):
     __tablename__ = "market_prices"
     id = Column(Integer, primary_key=True, index=True)
