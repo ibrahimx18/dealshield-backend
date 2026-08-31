@@ -8,7 +8,7 @@ from app.core.security_middleware import (
     HTTPSRedirectMiddleware,
     RateLimitMiddleware,
 )
-from app.routers import auth, listings, escrow, wallet, market, health, integrations, ai, reviews, payment_links, payments, dispatch
+from app.routers import auth, listings, escrow, wallet, market, health, integrations, ai, reviews, payment_links, payments, dispatch, admin
 
 
 # ── Startup secrets validation (audit finding C1/C2) ──
@@ -125,5 +125,6 @@ app.include_router(reviews.router, prefix="/reviews", tags=["reviews"])
 app.include_router(payment_links.router, prefix="/pay-links", tags=["payment-links"])
 app.include_router(payments.router, prefix="/payments", tags=["payments"])
 app.include_router(dispatch.router, prefix="/dispatch", tags=["dispatch"])
+app.include_router(admin.router, prefix="/admin", tags=["admin"])
 if __name__ == "__main__":
     uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=False)
