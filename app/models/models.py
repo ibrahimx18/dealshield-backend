@@ -85,11 +85,20 @@ class EscrowTransaction(Base):
     logistics_provider = Column(String, default="")
     tracking_number = Column(String, default="")
     insurance_fee = Column(Float, default=0)
-    pickup_otp = Column(String, default="")  # 4-digit OTP for rider pickup
+    pickup_otp = Column(String, default="")  # 6-digit OTP for rider pickup (audit C5: was 4-digit random.randint)
     rider_phone = Column(String, default="")  # dispatch rider's phone
     rider_name = Column(String, default="")
     pickup_confirmed = Column(Boolean, default=False)
     dispatched_at = Column(DateTime, nullable=True)
+    # ── Audit C5: OTP hardening columns ──
+    # NEW nullable columns added on the existing escrow_transactions table.
+    # MIGRATION NOTE (do not run automatically): these are picked up by
+    # Base.metadata.create_all() for brand-new SQLite DBs, but existing
+    # databases (e.g. Postgres in production) need a manual migration, e.g.:
+    #   ALTER TABLE escrow_transactions ADD COLUMN otp_attempts INTEGER DEFAULT 0;
+    #   ALTER TABLE escrow_transactions ADD COLUMN otp_locked BOOLEAN DEFAULT FALSE;
+    otp_attempts = Column(Integer, default=0, nullable=True)  # wrong-OTP attempt counter
+    otp_locked = Column(Boolean, default=False, nullable=True)  # true after 5 wrong attempts
 
 
 class WalletTx(Base):

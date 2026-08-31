@@ -6,8 +6,8 @@ Flow:
 3. Warehouse confirms OTP → order COMPLETED → funds released
 """
 
-import random
-from datetime import datetime
+import secrets
+from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from app.dependencies import get_db
@@ -16,6 +16,10 @@ from app.models.models import User, EscrowTransaction
 from app.schemas.schemas import DispatchRider, PickupConfirm
 
 router = APIRouter()
+
+# Audit C5: OTP hardening constants.
+OTP_MAX_ATTEMPTS = 5
+OTP_EXPIRY_HOURS = 24
 
 
 @router.post("/escrow/{tx_id}/dispatch")
@@ -29,9 +33,11 @@ def assign_rider(tx_id: int, rider: DispatchRider, current_user: User = Depends(
     if tx.status not in ("funds_deposited", "shipped"):
         raise HTTPException(status_code=400, detail=f"Cannot dispatch in {tx.status} state")
 
-    # Generate 4-digit OTP
-    otp = str(random.randint(1000, 9999))
+    # Generate 6-digit OTP using a CSPRNG (audit C5: was random.randint, 4-digit).
+    otp = str(secrets.randbelow(1_000_000)).zfill(6)
     tx.pickup_otp = otp
+    tx.otp_attempts = 0
+    tx.otp_locked = False
     tx.rider_name = rider.rider_name
     tx.rider_phone = rider.rider_phone
     tx.logistics_provider = rider.logistics_provider or tx.logistics_provider
@@ -59,7 +65,22 @@ def confirm_pickup(tx_id: int, pickup: PickupConfirm, db: Session = Depends(get_
         raise HTTPException(status_code=404, detail="Transaction not found")
     if tx.status != "shipped":
         raise HTTPException(status_code=400, detail=f"Order is {tx.status}, not shipped")
+
+    # Audit C5: OTP hardening — lockout after too many wrong attempts.
+    if tx.otp_locked:
+        raise HTTPException(status_code=423, detail="OTP locked after too many failed attempts. Contact support.")
+
+    # Audit C5: OTP expiry — 24h after dispatch.
+    if tx.dispatched_at and datetime.utcnow() - tx.dispatched_at > timedelta(hours=OTP_EXPIRY_HOURS):
+        raise HTTPException(status_code=400, detail="OTP has expired. Ask the seller to re-dispatch.")
+
     if tx.pickup_otp != pickup.otp:
+        tx.otp_attempts = (tx.otp_attempts or 0) + 1
+        if tx.otp_attempts >= OTP_MAX_ATTEMPTS:
+            tx.otp_locked = True
+            db.commit()
+            raise HTTPException(status_code=423, detail="Too many wrong OTP attempts. OTP is now locked; contact support.")
+        db.commit()
         raise HTTPException(status_code=400, detail="Invalid OTP")
     if tx.rider_phone and tx.rider_phone != pickup.rider_phone:
         raise HTTPException(status_code=400, detail="Rider phone does not match")
