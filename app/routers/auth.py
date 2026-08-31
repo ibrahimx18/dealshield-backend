@@ -1,3 +1,4 @@
+import os
 import time
 from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException
@@ -12,6 +13,10 @@ from app.core.notifications import notify_new_user, notify_kyc_submitted
 
 router = APIRouter()
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+
+# Audit L2/H1: the 500,000 "welcome bonus" wallet balance on signup is a
+# demo/test convenience and must not be granted in a real deployment.
+SAFEPAY_TEST_MODE = os.getenv("SAFEPAY_TEST_MODE", "false").strip().lower() in ("1", "true", "yes")
 
 def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
     payload = decode_access_token(token)
@@ -73,7 +78,7 @@ def register(user_in: UserCreate, db: Session = Depends(get_db)):
         phone=user_in.phone,
         email=user_in.email.lower().strip(),
         hashed_password=get_password_hash(user_in.password),
-        wallet_balance=500000.0,  # welcome bonus
+        wallet_balance=500000.0 if SAFEPAY_TEST_MODE else 0.0,  # welcome bonus — test/demo mode only (audit L2/H1)
         phone_verified=True,
     )
     db.add(user)
