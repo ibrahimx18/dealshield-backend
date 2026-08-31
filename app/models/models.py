@@ -1,82 +1,66 @@
-from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, ForeignKey, Enum as SQLEnum
+from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, ForeignKey, Text
 from sqlalchemy.orm import relationship
 from datetime import datetime
 from app.core.database import Base
-import enum
-
-class CommodityCategory(str, enum.Enum):
-    cars = "cars"
-    gold = "gold"
-    dollars = "dollars"
-    oil = "oil"
-    land = "land"
-    cement = "cement"
-    crypto = "crypto"
-    giftcards = "giftcards"
-
-class EscrowStatus(str, enum.Enum):
-    pending = "pending"
-    funds_deposited = "funds_deposited"
-    shipped = "shipped"
-    delivered = "delivered"
-    disputed = "disputed"
-    cancelled = "cancelled"
 
 
 class User(Base):
     __tablename__ = "users"
+
     id = Column(Integer, primary_key=True, index=True)
-    name = Column(String, nullable=False)
-    phone = Column(String, nullable=False, index=True)
-    email = Column(String, nullable=False, unique=True, index=True)
+    phone_number = Column(String, unique=True, index=True, nullable=False)
     hashed_password = Column(String, nullable=False)
+    full_name = Column(String, default="")
     wallet_balance = Column(Float, default=0.0)
-    nin_verified = Column(Boolean, default=False)
-    phone_verified = Column(Boolean, default=True)
-    id_verified = Column(Boolean, default=False)
-    bvn_verified = Column(Boolean, default=False)
-    business_verified = Column(Boolean, default=False)
-    business_name = Column(String, default="")
-    badge_tier = Column(String, default="none")  # none, verified, trusted, top_dealer
-    total_deals = Column(Integer, default=0)
-    rating = Column(Float, default=5.0)
-    failed_attempts = Column(Integer, default=0)
-    locked_until = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+    is_active = Column(Boolean, default=True)
+    is_verified = Column(Boolean, default=False)
+    verification_tier = Column(Integer, default=1)  # 1: basic phone, 2: NIN/BVN, 3: CAC/business
+    role = Column(String, default="user")  # user, merchant, admin
 
-    listings = relationship("Listing", backref="seller", foreign_keys="Listing.seller_id")
-    reviews_given = relationship("Review", backref="reviewer", foreign_keys="Review.reviewer_id")
-    reviews_received = relationship("Review", backref="reviewee", foreign_keys="Review.reviewee_id")
-
-
-class Listing(Base):
-    __tablename__ = "listings"
-    id = Column(Integer, primary_key=True, index=True)
-    category = Column(String, nullable=False)  # stored as string key
-    title = Column(String, nullable=False, index=True)
-    description = Column(String, default="")
-    price = Column(Float, nullable=False)
-    location = Column(String, default="")
-    seller_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    seller_name = Column(String, default="")
-    seller_rating = Column(String, default="5.0")
-    verified = Column(Boolean, default=False)
-    image_path = Column(String, nullable=True)
-    insured = Column(Boolean, default=False)
-    posted_date = Column(DateTime, default=datetime.utcnow)
+    # Relationships
+    escrows_as_buyer = relationship("EscrowTransaction", foreign_keys="EscrowTransaction.buyer_id", back_populates="buyer")
+    escrows_as_seller = relationship("EscrowTransaction", foreign_keys="EscrowTransaction.seller_id", back_populates="seller")
 
 
 class EscrowTransaction(Base):
     __tablename__ = "escrow_transactions"
+
     id = Column(Integer, primary_key=True, index=True)
-    listing_id = Column(Integer, ForeignKey("listings.id"), nullable=False)
-    listing_title = Column(String, nullable=False)
-    category = Column(String, nullable=False)
+    title = Column(String, nullable=False)
+    description = Column(String, default="")
     amount = Column(Float, nullable=False)
-    commission = Column(Float, nullable=False)
-    status = Column(String, default="pending")
+    fee = Column(Float, default=0.0)
+    status = Column(String, default="created")
+    # Statuses: created -> funded -> shipped -> inspect_period -> completed / disputed / cancelled
+
     buyer_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     seller_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+
+    category = Column(String, default="general")
+    # Categories: cars, real_estate, crypto, gold, fx, cement, general
+
+    # Cement specific metadata
+    cement_bags = Column(Integer, default=0)
+    cement_factory = Column(String, default="")
+
+    # Crypto / FX metadata
+    crypto_amount = Column(Float, default=0.0)
+    crypto_symbol = Column(String, default="")  # USDT, BTC
+    fiat_rate = Column(Float, default=0.0)
+
+    # Giftcard metadata
+    giftcard_type = Column(String, default="")  # Amazon, Apple, Steam
+    giftcard_code = Column(String, default="")
+
+    inspection_period_hours = Column(Integer, default=24)
+
+    # Relationships
+    buyer = relationship("User", foreign_keys=[buyer_id], back_populates="escrows_as_buyer")
+    seller = relationship("User", foreign_keys=[seller_id], back_populates="escrows_as_seller")
+
+    buyer_phone = Column(String, default="")
+    seller_phone = Column(String, default="")
     buyer_name = Column(String, default="")
     seller_name = Column(String, default="")
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -86,19 +70,17 @@ class EscrowTransaction(Base):
     tracking_number = Column(String, default="")
     insurance_fee = Column(Float, default=0)
     pickup_otp = Column(String, default="")  # 6-digit OTP for rider pickup (audit C5: was 4-digit random.randint)
+    pickup_otp_attempts = Column(Integer, default=0)
+    pickup_otp_expires_at = Column(DateTime, nullable=True)
     rider_phone = Column(String, default="")  # dispatch rider's phone
     rider_name = Column(String, default="")
     pickup_confirmed = Column(Boolean, default=False)
     dispatched_at = Column(DateTime, nullable=True)
+    
     # ── Audit C5: OTP hardening columns ──
-    # NEW nullable columns added on the existing escrow_transactions table.
-    # MIGRATION NOTE (do not run automatically): these are picked up by
-    # Base.metadata.create_all() for brand-new SQLite DBs, but existing
-    # databases (e.g. Postgres in production) need a manual migration, e.g.:
-    #   ALTER TABLE escrow_transactions ADD COLUMN otp_attempts INTEGER DEFAULT 0;
-    #   ALTER TABLE escrow_transactions ADD COLUMN otp_locked BOOLEAN DEFAULT FALSE;
     otp_attempts = Column(Integer, default=0, nullable=True)  # wrong-OTP attempt counter
     otp_locked = Column(Boolean, default=False, nullable=True)  # true after 5 wrong attempts
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class WalletTx(Base):
@@ -162,3 +144,26 @@ class PaymentLink(Base):
     status = Column(String, default="active")  # active, paid, expired
     created_at = Column(DateTime, default=datetime.utcnow)
     paid_at = Column(DateTime, nullable=True)
+
+
+class ProcessedPayment(Base):
+    """Tracks payment references that have been consumed to prevent replay attacks."""
+    __tablename__ = "processed_payments"
+    id = Column(Integer, primary_key=True, index=True)
+    reference = Column(String, unique=True, index=True, nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    provider = Column(String, nullable=False)
+    amount = Column(Float, nullable=False)
+    processed_at = Column(DateTime, default=datetime.utcnow)
+
+
+class AdminAuditLog(Base):
+    """Immutable audit trail for all admin dispute resolution actions."""
+    __tablename__ = "admin_audit_logs"
+    id = Column(Integer, primary_key=True, index=True)
+    admin_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    action = Column(String, nullable=False)  # release_to_seller, refund_to_buyer
+    target_type = Column(String, nullable=False)  # escrow_transaction
+    target_id = Column(Integer, nullable=False)
+    details = Column(String, default="")
+    created_at = Column(DateTime, default=datetime.utcnow)
