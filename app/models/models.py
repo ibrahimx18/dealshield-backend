@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, ForeignKey, Enum as SQLEnum
+from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, ForeignKey, Enum as SQLEnum, Text
 from sqlalchemy.orm import relationship
 from datetime import datetime
 from app.core.database import Base
@@ -35,6 +35,7 @@ class User(Base):
     wallet_balance = Column(Float, default=0.0)
     nin_verified = Column(Boolean, default=False)
     phone_verified = Column(Boolean, default=True)
+    email_verified = Column(Boolean, default=False, nullable=False)  # NEW: email verification flag
     id_verified = Column(Boolean, default=False)
     bvn_verified = Column(Boolean, default=False)
     business_verified = Column(Boolean, default=False)
@@ -44,18 +45,22 @@ class User(Base):
     rating = Column(Float, default=5.0)
     failed_attempts = Column(Integer, default=0)
     locked_until = Column(DateTime, nullable=True)
+    password_changed_at = Column(DateTime, nullable=True)  # NEW: track password changes for token invalidation
+    is_active = Column(Boolean, default=True, nullable=False)  # NEW: soft-disable instead of delete
     created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)  # NEW
     role = Column(String, default="user")  # user, merchant, admin
 
     listings = relationship("Listing", backref="seller", foreign_keys="Listing.seller_id")
     reviews_given = relationship("Review", backref="reviewer", foreign_keys="Review.reviewer_id")
     reviews_received = relationship("Review", backref="reviewee", foreign_keys="Review.reviewer_id")
+    sessions = relationship("Session", backref="user", cascade="all, delete-orphan")  # NEW
 
 
 class Listing(Base):
     __tablename__ = "listings"
     id = Column(Integer, primary_key=True, index=True)
-    category = Column(String, nullable=False)  # stored as string key
+    category = Column(String, nullable=False)
     title = Column(String, nullable=False, index=True)
     description = Column(String, default="")
     price = Column(Float, nullable=False)
@@ -66,7 +71,9 @@ class Listing(Base):
     verified = Column(Boolean, default=False)
     image_path = Column(String, nullable=True)
     insured = Column(Boolean, default=False)
+    is_active = Column(Boolean, default=True, nullable=False)  # NEW: soft-delete listings
     posted_date = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)  # NEW
 
 
 class EscrowTransaction(Base):
@@ -108,10 +115,11 @@ class WalletTx(Base):
     type = Column(String, nullable=False)  # deposit, withdraw, escrow_hold, escrow_release, escrow_refund
     description = Column(String, default="")
     timestamp = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)  # NEW
 
 
 class PaymentReference(Base):
-    """Audit C3: tracks payment references created at /payments/initialize so
+    """Tracks payment references created at /payments/initialize so
     /payments/verify can only credit a wallet once per reference, and only
     for the user who created it (prevents replay / idempotency abuse).
     """
@@ -123,6 +131,7 @@ class PaymentReference(Base):
     provider = Column(String, nullable=False, default="")
     status = Column(String, nullable=False, default="pending")  # pending -> consumed
     created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)  # NEW
 
 
 class MarketPrice(Base):
@@ -135,7 +144,7 @@ class MarketPrice(Base):
     unit = Column(String, default="unit")
     change = Column(Float, default=0.0)
     trending = Column(Boolean, default=False)
-    updated_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class Review(Base):
@@ -147,12 +156,13 @@ class Review(Base):
     rating = Column(Integer, nullable=False)  # 1-5
     comment = Column(String, default="")
     created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)  # NEW
 
 
 class PaymentLink(Base):
     __tablename__ = "payment_links"
     id = Column(Integer, primary_key=True, index=True)
-    link_code = Column(String, unique=True, index=True, nullable=False)  # short shareable code
+    link_code = Column(String, unique=True, index=True, nullable=False)
     seller_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     title = Column(String, nullable=False)
     description = Column(String, default="")
@@ -161,6 +171,7 @@ class PaymentLink(Base):
     status = Column(String, default="active")  # active, paid, expired
     created_at = Column(DateTime, default=datetime.utcnow)
     paid_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)  # NEW
 
 
 class ProcessedPayment(Base):
@@ -183,4 +194,48 @@ class AdminAuditLog(Base):
     target_type = Column(String, nullable=False)  # escrow_transaction
     target_id = Column(Integer, nullable=False)
     details = Column(String, default="")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class Session(Base):
+    """Tracks active user sessions for token revocation and audit.
+    Stores SHA-256 hash of the refresh token — never the raw token.
+    """
+    __tablename__ = "sessions"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    token_hash = Column(String(64), unique=True, index=True, nullable=False)  # SHA-256 hex
+    ip_address = Column(String(45), nullable=True)  # IPv4 or IPv6
+    user_agent = Column(Text, nullable=True)
+    expires_at = Column(DateTime, nullable=False)
+    revoked = Column(Boolean, default=False, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class PasswordResetToken(Base):
+    """One-time use password reset tokens with expiry.
+    Stores SHA-256 hash of the token — never the raw token.
+    """
+    __tablename__ = "password_reset_tokens"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    token_hash = Column(String(64), unique=True, index=True, nullable=False)  # SHA-256 hex
+    expires_at = Column(DateTime, nullable=False)
+    used = Column(Boolean, default=False, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class AuditLog(Base):
+    """General-purpose audit trail for all user actions (not just admin).
+    Records who did what, to what, when, with optional metadata.
+    """
+    __tablename__ = "audit_logs"
+    id = Column(Integer, primary_key=True, index=True)
+    actor_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    action = Column(String(100), nullable=False)  # login, register, escrow_create, etc.
+    target_type = Column(String(100), nullable=True)  # escrow_transaction, listing, user, etc.
+    target_id = Column(Integer, nullable=True)
+    ip_address = Column(String(45), nullable=True)
+    details = Column(Text, default="")
     created_at = Column(DateTime, default=datetime.utcnow)

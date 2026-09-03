@@ -21,6 +21,7 @@ class UserProfile(BaseModel):
     wallet_balance: float
     nin_verified: bool
     phone_verified: bool
+    email_verified: bool = False  # NEW
     id_verified: bool
     bvn_verified: bool = False
     business_verified: bool = False
@@ -31,8 +32,44 @@ class UserProfile(BaseModel):
 
 class AuthResponse(BaseModel):
     access_token: str
+    refresh_token: str = ""  # NEW: refresh token alongside access token
     token_type: str = "bearer"
     user: UserProfile
+
+
+class RefreshTokenRequest(BaseModel):
+    refresh_token: str
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+
+
+class EmailVerifyRequest(BaseModel):
+    token: str
+
+
+class PasswordResetRequest(BaseModel):
+    """Step 1: Request password reset (user provides email/phone)."""
+    email_or_phone: str
+
+
+class PasswordResetConfirm(BaseModel):
+    """Step 2: Confirm password reset with token + new password."""
+    token: str
+    new_password: str
+
+
+class ChangePasswordRequest(BaseModel):
+    """Change password while logged in (requires current password)."""
+    current_password: str
+    new_password: str
+
+
+class LogoutRequest(BaseModel):
+    refresh_token: str
 
 # === LISTING ===
 class ListingCreate(BaseModel):
