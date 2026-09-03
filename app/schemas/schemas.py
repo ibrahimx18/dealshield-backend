@@ -149,9 +149,37 @@ class EscrowOut(BaseModel):
     closed_at: Optional[datetime] = None
     accept_deadline: Optional[datetime] = None
     payment_deadline: Optional[datetime] = None
+    # Facilitator fields
+    is_facilitated: bool = False
+    facilitator_id: Optional[int] = None
+    facilitator_name: Optional[str] = None
+    facilitator_fee: float = 0.0
+    facilitator_fee_pct: float = 0.0
+    buyer_accepted_terms: bool = False
+    seller_accepted_terms: bool = False
 
 class EscrowListResponse(BaseModel):
     transactions: List[EscrowOut]
+
+
+# === FACILITATOR ===
+class FacilitatedDealCreate(BaseModel):
+    """Facilitator creates a deal between a buyer and seller.
+    No listing required — facilitator sets all terms.
+    """
+    title: str
+    category: str  # cars, gold, dollars, land, crypto, etc.
+    amount: float
+    buyer_phone: str   # buyer's phone (must be registered)
+    seller_phone: str  # seller's phone (must be registered)
+    description: str = ""
+    facilitator_fee_pct: float = 0.0  # % of DealShield commission (0-50%)
+    insured: bool = False
+
+
+class FacilitatorAcceptTerms(BaseModel):
+    """Buyer or seller accepts the facilitator's deal terms."""
+    role: str  # "buyer" or "seller"
 
 # === WALLET ===
 class WalletDeposit(BaseModel):

@@ -136,6 +136,16 @@ class EscrowTransaction(Base):
     # ── Expiry deadlines ──
     accept_deadline = Column(DateTime, nullable=True)      # seller must accept within 48h
     payment_deadline = Column(DateTime, nullable=True)     # buyer must pay within 24h
+    # ── Facilitator columns ──
+    facilitator_id = Column(Integer, ForeignKey("users.id"), nullable=True)  # deal facilitator (middleman)
+    facilitator_name = Column(String, default="")
+    facilitator_fee = Column(Float, default=0.0)           # fee paid to facilitator on completion
+    facilitator_fee_pct = Column(Float, default=0.0)       # percentage of commission (e.g. 30 = 30% of DealShield fee)
+    buyer_accepted_terms = Column(Boolean, default=False)  # buyer agreed to facilitator's deal terms
+    seller_accepted_terms = Column(Boolean, default=False) # seller agreed to facilitator's deal terms
+    buyer_accepted_at = Column(DateTime, nullable=True)
+    seller_accepted_at = Column(DateTime, nullable=True)
+    is_facilitated = Column(Boolean, default=False)        # true if this deal was created by a facilitator
 
 
 class WalletTx(Base):

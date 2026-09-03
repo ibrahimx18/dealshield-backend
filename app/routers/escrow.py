@@ -15,7 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
 from app.dependencies import get_db
-from app.schemas.schemas import EscrowCreate, EscrowShip, EscrowOut, EscrowListResponse, EscrowDispute, EscrowFulfill
+from app.schemas.schemas import EscrowCreate, EscrowShip, EscrowOut, EscrowListResponse, EscrowDispute, EscrowFulfill, FacilitatedDealCreate, FacilitatorAcceptTerms
 from app.models.models import EscrowTransaction, User, Listing, WalletTx, AuditLog
 from app.routers.auth import get_current_user, _update_badge
 from app.core.config import settings
@@ -65,6 +65,13 @@ def _tx_dict(tx: EscrowTransaction) -> dict:
         "closed_at": tx.closed_at.isoformat() if tx.closed_at else None,
         "accept_deadline": tx.accept_deadline.isoformat() if tx.accept_deadline else None,
         "payment_deadline": tx.payment_deadline.isoformat() if tx.payment_deadline else None,
+        "is_facilitated": tx.is_facilitated,
+        "facilitator_id": tx.facilitator_id,
+        "facilitator_name": tx.facilitator_name or "",
+        "facilitator_fee": tx.facilitator_fee or 0.0,
+        "facilitator_fee_pct": tx.facilitator_fee_pct or 0.0,
+        "buyer_accepted_terms": tx.buyer_accepted_terms,
+        "seller_accepted_terms": tx.seller_accepted_terms,
     }
 
 
@@ -93,11 +100,21 @@ def _calc_commission(category: str, price: float, bag_count: int | None = None) 
 
 
 def _release_funds(db: Session, tx: EscrowTransaction):
-    """Release escrow funds to seller (amount - commission)."""
+    """Release escrow funds to seller (amount - commission).
+    If deal is facilitated, facilitator gets their share of the commission.
+    """
     seller = db.query(User).filter(User.id == tx.seller_id).first()
+    buyer = db.query(User).filter(User.id == tx.buyer_id).first()
+
+    # Calculate facilitator fee (percentage of DealShield commission)
+    facilitator_fee = 0.0
+    if tx.is_facilitated and tx.facilitator_id and tx.facilitator_fee_pct > 0:
+        facilitator_fee = round(tx.commission * (tx.facilitator_fee_pct / 100.0), 2)
+        tx.facilitator_fee = facilitator_fee
+
+    # Seller gets amount minus full commission (facilitator paid from commission)
     seller.wallet_balance += tx.amount - tx.commission
     seller.total_deals += 1
-    buyer = db.query(User).filter(User.id == tx.buyer_id).first()
     buyer.total_deals += 1
     _update_badge(seller)
     _update_badge(buyer)
@@ -105,6 +122,16 @@ def _release_funds(db: Session, tx: EscrowTransaction):
         user_id=seller.id, amount=tx.amount - tx.commission, type="escrow_release",
         description=f"Escrow release for {tx.listing_title}"
     ))
+
+    # Pay facilitator their share
+    if facilitator_fee > 0 and tx.facilitator_id:
+        facilitator = db.query(User).filter(User.id == tx.facilitator_id).first()
+        if facilitator:
+            facilitator.wallet_balance += facilitator_fee
+            db.add(WalletTx(
+                user_id=facilitator.id, amount=facilitator_fee, type="facilitator_fee",
+                description=f"Facilitator fee for {tx.listing_title} ({tx.facilitator_fee_pct}% of commission)"
+            ))
 
 
 def _refund_buyer(db: Session, tx: EscrowTransaction, partial_amount: float | None = None):
@@ -537,7 +564,8 @@ def get_transactions(current_user: User = Depends(get_current_user),
                      db: Session = Depends(get_db)):
     txs = db.query(EscrowTransaction).filter(
         (EscrowTransaction.buyer_id == current_user.id) |
-        (EscrowTransaction.seller_id == current_user.id)
+        (EscrowTransaction.seller_id == current_user.id) |
+        (EscrowTransaction.facilitator_id == current_user.id)
     ).order_by(EscrowTransaction.created_at.desc()).all()
     return {"transactions": [_tx_dict(t) for t in txs]}
 
@@ -553,6 +581,162 @@ def get_transaction(tx_id: int, current_user: User = Depends(get_current_user),
     if current_user.id not in (tx.buyer_id, tx.seller_id):
         raise HTTPException(status_code=403, detail="Not authorized")
     return _tx_dict(tx)
+
+
+# ── FACILITATOR ENDPOINTS ──
+
+@router.post("/facilitate/create", response_model=EscrowOut)
+def facilitator_create_deal(deal_in: FacilitatedDealCreate, request: Request,
+                            current_user: User = Depends(get_current_user),
+                            db: Session = Depends(get_db)):
+    """Facilitator creates a deal between a buyer and seller.
+    No listing required — facilitator sets all terms.
+    Both buyer and seller must be registered on DealShield.
+    """
+    # Validate facilitator fee percentage
+    if deal_in.facilitator_fee_pct < 0 or deal_in.facilitator_fee_pct > 50:
+        raise HTTPException(status_code=400, detail="Facilitator fee must be between 0% and 50%")
+
+    # Find buyer and seller by phone
+    buyer = db.query(User).filter(User.phone == deal_in.buyer_phone, User.is_active == True).first()
+    if not buyer:
+        raise HTTPException(status_code=404, detail=f"No registered buyer found with phone {deal_in.buyer_phone}")
+
+    seller = db.query(User).filter(User.phone == deal_in.seller_phone, User.is_active == True).first()
+    if not seller:
+        raise HTTPException(status_code=404, detail=f"No registered seller found with phone {deal_in.seller_phone}")
+
+    if buyer.id == seller.id:
+        raise HTTPException(status_code=400, detail="Buyer and seller cannot be the same person")
+
+    if current_user.id in (buyer.id, seller.id):
+        raise HTTPException(status_code=400, detail="Facilitator cannot be the buyer or seller")
+
+    # Calculate commission
+    commission = _calc_commission(deal_in.category, deal_in.amount)
+
+    insurance_fee = 0
+    if deal_in.insured:
+        insurance_fee = round(deal_in.amount * INSURANCE_RATE, 2)
+
+    now = datetime.utcnow()
+    tx = EscrowTransaction(
+        listing_id=0,  # No listing for facilitated deals
+        listing_title=sanitize_text(deal_in.title, max_length=200),
+        category=deal_in.category,
+        amount=deal_in.amount,
+        commission=commission,
+        status="created",
+        buyer_id=buyer.id,
+        seller_id=seller.id,
+        buyer_name=buyer.name,
+        seller_name=seller.name,
+        insured=deal_in.insured,
+        insurance_fee=insurance_fee,
+        is_facilitated=True,
+        facilitator_id=current_user.id,
+        facilitator_name=current_user.name,
+        facilitator_fee_pct=deal_in.facilitator_fee_pct,
+        accept_deadline=now + timedelta(hours=ACCEPT_DEADLINE_HOURS),
+    )
+    db.add(tx)
+    db.flush()
+
+    _log_audit(db, current_user.id, "facilitator_create_deal", request, target_id=tx.id,
+               details=f"Facilitated deal: {deal_in.title}, Buyer: {buyer.name}, Seller: {seller.name}, Amount: {deal_in.amount}")
+    db.commit()
+    db.refresh(tx)
+    notify_escrow_event(_tx_dict(tx), "escrow_created")
+    return _tx_dict(tx)
+
+
+@router.post("/{tx_id}/accept-terms", response_model=EscrowOut)
+def accept_deal_terms(tx_id: int, accept_in: FacilitatorAcceptTerms, request: Request,
+                     current_user: User = Depends(get_current_user),
+                     db: Session = Depends(get_db)):
+    """Buyer or seller accepts the facilitator's deal terms.
+    Once both accept, the deal moves to 'seller_accepted' (ready for funding).
+    """
+    tx = db.query(EscrowTransaction).filter(EscrowTransaction.id == tx_id).first()
+    if not tx:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    if not tx.is_facilitated:
+        raise HTTPException(status_code=400, detail="This is not a facilitated deal")
+    if tx.status != "created":
+        raise HTTPException(status_code=400, detail=f"Cannot accept terms — current status: {tx.status}")
+
+    now = datetime.utcnow()
+
+    if accept_in.role == "buyer":
+        if current_user.id != tx.buyer_id:
+            raise HTTPException(status_code=403, detail="Only the buyer can accept buyer terms")
+        if tx.buyer_accepted_terms:
+            return _tx_dict(tx)  # Already accepted
+        tx.buyer_accepted_terms = True
+        tx.buyer_accepted_at = now
+        _log_audit(db, current_user.id, "facilitated_buyer_accept", request, target_id=tx.id)
+
+    elif accept_in.role == "seller":
+        if current_user.id != tx.seller_id:
+            raise HTTPException(status_code=403, detail="Only the seller can accept seller terms")
+        if tx.seller_accepted_terms:
+            return _tx_dict(tx)  # Already accepted
+        tx.seller_accepted_terms = True
+        tx.seller_accepted_at = now
+        _log_audit(db, current_user.id, "facilitated_seller_accept", request, target_id=tx.id)
+
+    else:
+        raise HTTPException(status_code=400, detail="Role must be 'buyer' or 'seller'")
+
+    # If both accepted, move to seller_accepted (ready for funding)
+    if tx.buyer_accepted_terms and tx.seller_accepted_terms:
+        tx.status = "seller_accepted"
+        tx.accepted_at = now
+        tx.payment_deadline = now + timedelta(hours=PAYMENT_DEADLINE_HOURS)
+
+    db.commit()
+    db.refresh(tx)
+    notify_escrow_event(_tx_dict(tx), "escrow_terms_accepted")
+    return _tx_dict(tx)
+
+
+@router.get("/facilitated/transactions", response_model=EscrowListResponse)
+def get_facilitated_transactions(current_user: User = Depends(get_current_user),
+                                  db: Session = Depends(get_db)):
+    """List all deals where the current user is the facilitator."""
+    txs = db.query(EscrowTransaction).filter(
+        EscrowTransaction.facilitator_id == current_user.id,
+        EscrowTransaction.is_facilitated == True,
+    ).order_by(EscrowTransaction.created_at.desc()).all()
+    return {"transactions": [_tx_dict(t) for t in txs]}
+
+
+@router.get("/facilitated/stats")
+def get_facilitator_stats(current_user: User = Depends(get_current_user),
+                          db: Session = Depends(get_db)):
+    """Dashboard stats for the facilitator."""
+    txs = db.query(EscrowTransaction).filter(
+        EscrowTransaction.facilitator_id == current_user.id,
+        EscrowTransaction.is_facilitated == True,
+    ).all()
+
+    total = len(txs)
+    active = sum(1 for t in txs if t.status not in ("closed", "cancelled", "expired", "seller_declined"))
+    completed = sum(1 for t in txs if t.status in ("released", "closed"))
+    disputed = sum(1 for t in txs if t.status in ("disputed", "under_investigation"))
+    total_earned = sum(t.facilitator_fee or 0 for t in txs if t.status in ("released", "closed"))
+
+    pending_acceptance = sum(1 for t in txs if t.status == "created" and
+                            not (t.buyer_accepted_terms and t.seller_accepted_terms))
+
+    return {
+        "total_deals": total,
+        "active_deals": active,
+        "completed_deals": completed,
+        "disputed_deals": disputed,
+        "pending_acceptance": pending_acceptance,
+        "total_facilitator_earned": total_earned,
+    }
 
 
 # ── LEGACY ENDPOINTS (backward compat) ──
