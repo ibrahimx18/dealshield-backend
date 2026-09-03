@@ -1,23 +1,15 @@
--- DealShield Facilitator Feature Migration
--- Adds facilitator support: a third party (facilitator/middleman) can create
--- deals between buyers and sellers and earn a percentage of the commission.
+-- DealShield Facilitator Feature Migration v2
+-- Redesigned: facilitator sets their own fee amount (not percentage).
+-- DealShield takes 10% of the facilitator fee, facilitator gets 90%.
+-- No escrow commission on facilitated deals.
 
--- 1. Add facilitator columns to escrow_transactions
-ALTER TABLE escrow_transactions ADD COLUMN IF NOT EXISTS facilitator_id INTEGER REFERENCES users(id);
-ALTER TABLE escrow_transactions ADD COLUMN IF NOT EXISTS facilitator_name VARCHAR(255) DEFAULT '';
-ALTER TABLE escrow_transactions ADD COLUMN IF NOT EXISTS facilitator_fee FLOAT DEFAULT 0.0;
-ALTER TABLE escrow_transactions ADD COLUMN IF NOT EXISTS facilitator_fee_pct FLOAT DEFAULT 0.0;
-ALTER TABLE escrow_transactions ADD COLUMN IF NOT EXISTS buyer_accepted_terms BOOLEAN DEFAULT FALSE;
-ALTER TABLE escrow_transactions ADD COLUMN IF NOT EXISTS seller_accepted_terms BOOLEAN DEFAULT FALSE;
-ALTER TABLE escrow_transactions ADD COLUMN IF NOT EXISTS buyer_accepted_at TIMESTAMPTZ;
-ALTER TABLE escrow_transactions ADD COLUMN IF NOT EXISTS seller_accepted_at TIMESTAMPTZ;
-ALTER TABLE escrow_transactions ADD COLUMN IF NOT EXISTS is_facilitated BOOLEAN DEFAULT FALSE;
+-- 1. Add new facilitator columns
+ALTER TABLE escrow_transactions ADD COLUMN IF NOT EXISTS dealshield_cut FLOAT DEFAULT 0.0;
+ALTER TABLE escrow_transactions ADD COLUMN IF NOT EXISTS facilitator_payout FLOAT DEFAULT 0.0;
 
--- 2. Add index for facilitator queries
-CREATE INDEX IF NOT EXISTS idx_escrow_facilitator ON escrow_transactions(facilitator_id)
-    WHERE is_facilitated = TRUE;
+-- 2. Remove old facilitator_fee_pct column (if it exists from v1)
+ALTER TABLE escrow_transactions DROP COLUMN IF EXISTS facilitator_fee_pct;
 
--- 3. Allow listing_id = 0 for facilitated deals (no listing required)
--- This is handled at the application level — no DB change needed since
--- listing_id is an integer, not a FK constraint (it references listings.id
--- but 0 won't exist, which is fine for facilitated deals that don't need a listing)
+-- 3. Existing facilitator columns from v1 migration (kept):
+-- facilitator_id, facilitator_name, facilitator_fee, buyer_accepted_terms,
+-- seller_accepted_terms, buyer_accepted_at, seller_accepted_at, is_facilitated

@@ -154,7 +154,8 @@ class EscrowOut(BaseModel):
     facilitator_id: Optional[int] = None
     facilitator_name: Optional[str] = None
     facilitator_fee: float = 0.0
-    facilitator_fee_pct: float = 0.0
+    dealshield_cut: float = 0.0
+    facilitator_payout: float = 0.0
     buyer_accepted_terms: bool = False
     seller_accepted_terms: bool = False
 
@@ -165,15 +166,17 @@ class EscrowListResponse(BaseModel):
 # === FACILITATOR ===
 class FacilitatedDealCreate(BaseModel):
     """Facilitator creates a deal between a buyer and seller.
-    No listing required — facilitator sets all terms.
+    Facilitator sets the deal amount and their own facilitation fee.
+    On release: seller gets deal amount, facilitator gets 90% of their fee,
+    DealShield keeps 10% of the facilitator's fee.
     """
     title: str
     category: str  # cars, gold, dollars, land, crypto, etc.
-    amount: float
-    buyer_phone: str   # buyer's phone (must be registered)
-    seller_phone: str  # seller's phone (must be registered)
+    deal_amount: float         # amount agreed between buyer and seller for the goods
+    facilitator_fee: float      # fee the facilitator charges for brokering (agreed with buyer/seller)
+    buyer_phone: str            # buyer's phone (must be registered)
+    seller_phone: str           # seller's phone (must be registered)
     description: str = ""
-    facilitator_fee_pct: float = 0.0  # % of DealShield commission (0-50%)
     insured: bool = False
 
 

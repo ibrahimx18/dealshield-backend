@@ -159,7 +159,7 @@ def resolve_dispute(
         db.rollback()
         raise HTTPException(status_code=409, detail="Transaction status changed concurrently; aborting dispute resolution.")
 
-    total_pool = tx.amount + (tx.insurance_fee or 0)
+    total_pool = tx.amount + (tx.facilitator_fee if tx.is_facilitated else 0) + (tx.insurance_fee or 0)
     details_str = f"Decision: {req.decision}. Reason: {req.reason.strip()}."
 
     if req.decision == "release_to_seller":

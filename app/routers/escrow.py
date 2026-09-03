@@ -69,7 +69,8 @@ def _tx_dict(tx: EscrowTransaction) -> dict:
         "facilitator_id": tx.facilitator_id,
         "facilitator_name": tx.facilitator_name or "",
         "facilitator_fee": tx.facilitator_fee or 0.0,
-        "facilitator_fee_pct": tx.facilitator_fee_pct or 0.0,
+        "dealshield_cut": tx.dealshield_cut or 0.0,
+        "facilitator_payout": tx.facilitator_payout or 0.0,
         "buyer_accepted_terms": tx.buyer_accepted_terms,
         "seller_accepted_terms": tx.seller_accepted_terms,
     }
@@ -100,44 +101,66 @@ def _calc_commission(category: str, price: float, bag_count: int | None = None) 
 
 
 def _release_funds(db: Session, tx: EscrowTransaction):
-    """Release escrow funds to seller (amount - commission).
-    If deal is facilitated, facilitator gets their share of the commission.
+    """Release escrow funds.
+    Normal deal: seller gets amount - commission.
+    Facilitated deal: seller gets full deal amount, facilitator gets 90% of their fee,
+    DealShield keeps 10% of the facilitator's fee.
     """
     seller = db.query(User).filter(User.id == tx.seller_id).first()
     buyer = db.query(User).filter(User.id == tx.buyer_id).first()
 
-    # Calculate facilitator fee (percentage of DealShield commission)
-    facilitator_fee = 0.0
-    if tx.is_facilitated and tx.facilitator_id and tx.facilitator_fee_pct > 0:
-        facilitator_fee = round(tx.commission * (tx.facilitator_fee_pct / 100.0), 2)
-        tx.facilitator_fee = facilitator_fee
+    if tx.is_facilitated:
+        # Facilitated deal: no escrow commission, facilitator fee is split 90/10
+        seller.wallet_balance += tx.amount  # full deal amount to seller
+        seller.total_deals += 1
+        buyer.total_deals += 1
+        _update_badge(seller)
+        _update_badge(buyer)
+        db.add(WalletTx(
+            user_id=seller.id, amount=tx.amount, type="escrow_release",
+            description=f"Escrow release for {tx.listing_title} (facilitated)"
+        ))
 
-    # Seller gets amount minus full commission (facilitator paid from commission)
-    seller.wallet_balance += tx.amount - tx.commission
-    seller.total_deals += 1
-    buyer.total_deals += 1
-    _update_badge(seller)
-    _update_badge(buyer)
-    db.add(WalletTx(
-        user_id=seller.id, amount=tx.amount - tx.commission, type="escrow_release",
-        description=f"Escrow release for {tx.listing_title}"
-    ))
+        # Calculate facilitator payout: 90% to facilitator, 10% to DealShield
+        if tx.facilitator_fee and tx.facilitator_fee > 0:
+            dealshield_cut = round(tx.facilitator_fee * 0.10, 2)
+            facilitator_payout = round(tx.facilitator_fee * 0.90, 2)
+            tx.dealshield_cut = dealshield_cut
+            tx.facilitator_payout = facilitator_payout
 
-    # Pay facilitator their share
-    if facilitator_fee > 0 and tx.facilitator_id:
-        facilitator = db.query(User).filter(User.id == tx.facilitator_id).first()
-        if facilitator:
-            facilitator.wallet_balance += facilitator_fee
-            db.add(WalletTx(
-                user_id=facilitator.id, amount=facilitator_fee, type="facilitator_fee",
-                description=f"Facilitator fee for {tx.listing_title} ({tx.facilitator_fee_pct}% of commission)"
-            ))
+            if tx.facilitator_id:
+                facilitator = db.query(User).filter(User.id == tx.facilitator_id).first()
+                if facilitator:
+                    facilitator.wallet_balance += facilitator_payout
+                    db.add(WalletTx(
+                        user_id=facilitator.id, amount=facilitator_payout, type="facilitator_payout",
+                        description=f"Facilitator payout for {tx.listing_title} (90% of ₦{tx.facilitator_fee:,.0f} fee)"
+                    ))
+    else:
+        # Normal deal: seller gets amount minus commission
+        seller.wallet_balance += tx.amount - tx.commission
+        seller.total_deals += 1
+        buyer.total_deals += 1
+        _update_badge(seller)
+        _update_badge(buyer)
+        db.add(WalletTx(
+            user_id=seller.id, amount=tx.amount - tx.commission, type="escrow_release",
+            description=f"Escrow release for {tx.listing_title}"
+        ))
 
 
 def _refund_buyer(db: Session, tx: EscrowTransaction, partial_amount: float | None = None):
-    """Refund buyer (full or partial)."""
+    """Refund buyer (full or partial).
+    Facilitated deal: refund = deal_amount + facilitator_fee + insurance.
+    Normal deal: refund = amount + insurance.
+    """
     buyer = db.query(User).filter(User.id == tx.buyer_id).first()
-    refund = partial_amount if partial_amount is not None else (tx.amount + (tx.insurance_fee or 0))
+    if partial_amount is not None:
+        refund = partial_amount
+    elif tx.is_facilitated:
+        refund = tx.amount + tx.facilitator_fee + (tx.insurance_fee or 0)
+    else:
+        refund = tx.amount + (tx.insurance_fee or 0)
     buyer.wallet_balance += refund
     db.add(WalletTx(
         user_id=buyer.id, amount=refund, type="escrow_refund",
@@ -273,7 +296,12 @@ def fund_escrow(tx_id: int, request: Request,
         db.commit()
         raise HTTPException(status_code=400, detail="Payment deadline expired")
 
-    total = tx.amount + (tx.insurance_fee or 0)
+    # Calculate total buyer must pay
+    if tx.is_facilitated:
+        total = tx.amount + tx.facilitator_fee + (tx.insurance_fee or 0)
+    else:
+        total = tx.amount + (tx.insurance_fee or 0)
+
     if current_user.wallet_balance < total:
         raise HTTPException(
             status_code=400,
@@ -590,12 +618,14 @@ def facilitator_create_deal(deal_in: FacilitatedDealCreate, request: Request,
                             current_user: User = Depends(get_current_user),
                             db: Session = Depends(get_db)):
     """Facilitator creates a deal between a buyer and seller.
-    No listing required — facilitator sets all terms.
-    Both buyer and seller must be registered on DealShield.
+    Facilitator sets the deal amount (agreed between buyer & seller for goods)
+    and their facilitation fee (what they charge for brokering).
+    On release: seller gets full deal amount, facilitator gets 90% of their fee,
+    DealShield keeps 10% of the facilitator's fee.
     """
-    # Validate facilitator fee percentage
-    if deal_in.facilitator_fee_pct < 0 or deal_in.facilitator_fee_pct > 50:
-        raise HTTPException(status_code=400, detail="Facilitator fee must be between 0% and 50%")
+    # Validate facilitator fee
+    if deal_in.facilitator_fee < 0:
+        raise HTTPException(status_code=400, detail="Facilitator fee cannot be negative")
 
     # Find buyer and seller by phone
     buyer = db.query(User).filter(User.phone == deal_in.buyer_phone, User.is_active == True).first()
@@ -612,20 +642,17 @@ def facilitator_create_deal(deal_in: FacilitatedDealCreate, request: Request,
     if current_user.id in (buyer.id, seller.id):
         raise HTTPException(status_code=400, detail="Facilitator cannot be the buyer or seller")
 
-    # Calculate commission
-    commission = _calc_commission(deal_in.category, deal_in.amount)
-
     insurance_fee = 0
     if deal_in.insured:
-        insurance_fee = round(deal_in.amount * INSURANCE_RATE, 2)
+        insurance_fee = round(deal_in.deal_amount * INSURANCE_RATE, 2)
 
     now = datetime.utcnow()
     tx = EscrowTransaction(
         listing_id=0,  # No listing for facilitated deals
         listing_title=sanitize_text(deal_in.title, max_length=200),
         category=deal_in.category,
-        amount=deal_in.amount,
-        commission=commission,
+        amount=deal_in.deal_amount,
+        commission=0,  # No escrow commission for facilitated deals
         status="created",
         buyer_id=buyer.id,
         seller_id=seller.id,
@@ -636,14 +663,14 @@ def facilitator_create_deal(deal_in: FacilitatedDealCreate, request: Request,
         is_facilitated=True,
         facilitator_id=current_user.id,
         facilitator_name=current_user.name,
-        facilitator_fee_pct=deal_in.facilitator_fee_pct,
+        facilitator_fee=deal_in.facilitator_fee,
         accept_deadline=now + timedelta(hours=ACCEPT_DEADLINE_HOURS),
     )
     db.add(tx)
     db.flush()
 
     _log_audit(db, current_user.id, "facilitator_create_deal", request, target_id=tx.id,
-               details=f"Facilitated deal: {deal_in.title}, Buyer: {buyer.name}, Seller: {seller.name}, Amount: {deal_in.amount}")
+               details=f"Facilitated: {deal_in.title}, Deal: ₦{deal_in.deal_amount:,.0f}, Fee: ₦{deal_in.facilitator_fee:,.0f}, Buyer: {buyer.name}, Seller: {seller.name}")
     db.commit()
     db.refresh(tx)
     notify_escrow_event(_tx_dict(tx), "escrow_created")
