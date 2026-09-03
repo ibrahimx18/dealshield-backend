@@ -17,12 +17,27 @@ class CommodityCategory(str, enum.Enum):
 
 
 class EscrowStatus(str, enum.Enum):
+    created = "created"
+    seller_accepted = "seller_accepted"
+    seller_declined = "seller_declined"
+    payment_pending = "payment_pending"
+    funded = "funded"
+    seller_fulfilling = "seller_fulfilling"
+    buyer_review = "buyer_review"
+    buyer_approved = "buyer_approved"
+    disputed = "disputed"
+    under_investigation = "under_investigation"
+    released = "released"
+    refunded = "refunded"
+    split_resolution = "split_resolution"
+    cancelled = "cancelled"
+    expired = "expired"
+    closed = "closed"
+    # Legacy statuses (for backward compat with existing transactions)
     pending = "pending"
     funds_deposited = "funds_deposited"
     shipped = "shipped"
     delivered = "delivered"
-    disputed = "disputed"
-    cancelled = "cancelled"
 
 
 class User(Base):
@@ -84,7 +99,7 @@ class EscrowTransaction(Base):
     category = Column(String, nullable=False)
     amount = Column(Float, nullable=False)
     commission = Column(Float, nullable=False)
-    status = Column(String, default="pending")
+    status = Column(String, default="created")
     buyer_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     seller_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     buyer_name = Column(String, default="")
@@ -95,16 +110,32 @@ class EscrowTransaction(Base):
     logistics_provider = Column(String, default="")
     tracking_number = Column(String, default="")
     insurance_fee = Column(Float, default=0)
-    pickup_otp = Column(String, default="")  # 6-digit OTP for rider pickup (audit C5: was 4-digit random.randint)
+    pickup_otp = Column(String, default="")  # 6-digit OTP for rider pickup
     rider_phone = Column(String, default="")  # dispatch rider's phone
     rider_name = Column(String, default="")
     pickup_confirmed = Column(Boolean, default=False)
     dispatched_at = Column(DateTime, nullable=True)
-    # ── Audit C5: OTP hardening columns ──
-    otp_attempts = Column(Integer, default=0, nullable=True)  # wrong-OTP attempt counter
-    otp_locked = Column(Boolean, default=False, nullable=True)  # true after 5 wrong attempts
-    otp_expiry = Column(DateTime, nullable=True)  # 24h OTP expiry
+    # ── OTP hardening columns ──
+    otp_attempts = Column(Integer, default=0, nullable=True)
+    otp_locked = Column(Boolean, default=False, nullable=True)
+    otp_expiry = Column(DateTime, nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    # ── New escrow flow columns ──
+    accepted_at = Column(DateTime, nullable=True)          # seller accepted the deal
+    funded_at = Column(DateTime, nullable=True)            # payment confirmed
+    fulfilment_started_at = Column(DateTime, nullable=True) # seller began fulfilling
+    buyer_review_started_at = Column(DateTime, nullable=True)  # buyer received goods
+    buyer_review_deadline = Column(DateTime, nullable=True)    # auto-release after this
+    dispute_reason = Column(Text, nullable=True)           # who disputed and why
+    dispute_evidence = Column(Text, nullable=True)         # JSON: links, docs, messages
+    dispute_initiated_by = Column(String, default="")      # buyer or seller
+    admin_resolution = Column(String, nullable=True)       # release_to_seller, refund_to_buyer, split
+    admin_reason = Column(Text, nullable=True)             # admin's explanation
+    resolved_at = Column(DateTime, nullable=True)          # when admin resolved
+    closed_at = Column(DateTime, nullable=True)             # terminal state timestamp
+    # ── Expiry deadlines ──
+    accept_deadline = Column(DateTime, nullable=True)      # seller must accept within 48h
+    payment_deadline = Column(DateTime, nullable=True)     # buyer must pay within 24h
 
 
 class WalletTx(Base):

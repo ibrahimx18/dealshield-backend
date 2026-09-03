@@ -44,9 +44,9 @@ def list_disputed_transactions(
     db: Session = Depends(get_db),
     admin: User = Depends(require_admin)
 ):
-    """List all transactions currently in 'disputed' status for admin review."""
+    """List all transactions currently in 'disputed' or 'under_investigation' status."""
     disputes = db.query(EscrowTransaction).filter(
-        EscrowTransaction.status == "disputed"
+        EscrowTransaction.status.in_(["disputed", "under_investigation"])
     ).order_by(EscrowTransaction.created_at.desc()).all()
 
     result = []
@@ -74,6 +74,24 @@ def list_disputed_transactions(
     return {"disputes": result, "count": len(result)}
 
 
+@router.post("/disputes/{tx_id}/investigate", response_model=dict)
+def start_investigation(
+    tx_id: int,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin)
+):
+    """Move a disputed transaction to 'under_investigation' status."""
+    tx = db.query(EscrowTransaction).filter(EscrowTransaction.id == tx_id).first()
+    if not tx:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    if tx.status != "disputed":
+        raise HTTPException(status_code=400, detail=f"Transaction is in '{tx.status}', not 'disputed'")
+
+    tx.status = "under_investigation"
+    db.commit()
+    return {"status": "success", "message": f"Transaction #{tx_id} moved to investigation", "new_status": tx.status}
+
+
 @router.post("/disputes/{tx_id}/resolve", response_model=dict)
 def resolve_dispute(
     tx_id: int,
@@ -82,13 +100,14 @@ def resolve_dispute(
     admin: User = Depends(require_admin)
 ):
     """
-    Resolve a disputed escrow transaction.
+    Resolve a disputed/under_investigation escrow transaction.
     Decisions supported:
       - 'release_to_seller': Full amount (minus commission) goes to seller.
       - 'refund_to_buyer': Full amount (+ insurance fee) refunded to buyer.
       - 'split': Split funds between buyer and seller based on buyer_split_percent.
-    
-    Uses atomic status update to prevent race conditions. Creates immutable AdminAuditLog.
+
+    Sets proper terminal status (released/refunded/split_resolution) and resolution metadata.
+    Creates immutable AdminAuditLog.
     """
     if not req.reason or len(req.reason.strip()) < 5:
         raise HTTPException(status_code=400, detail="A valid resolution reason (at least 5 characters) is required.")
@@ -97,10 +116,10 @@ def resolve_dispute(
     if not tx:
         raise HTTPException(status_code=404, detail="Transaction not found")
 
-    if tx.status != "disputed":
+    if tx.status not in ("disputed", "under_investigation"):
         raise HTTPException(
             status_code=400,
-            detail=f"Transaction {tx_id} is in status '{tx.status}', not 'disputed'."
+            detail=f"Transaction {tx_id} is in status '{tx.status}', not 'disputed' or 'under_investigation'."
         )
 
     buyer = db.query(User).filter(User.id == tx.buyer_id).first()
@@ -108,16 +127,31 @@ def resolve_dispute(
     if not buyer or not seller:
         raise HTTPException(status_code=400, detail="Buyer or seller account missing for this transaction.")
 
-    # Atomic conditional update: change status from 'disputed' to 'resolved_admin'
-    completed_at = datetime.utcnow()
-    new_status = f"resolved_{req.decision}"
-    
+    now = datetime.utcnow()
+    tx.admin_resolution = req.decision
+    tx.admin_reason = req.reason.strip()
+    tx.resolved_at = now
+
+    # Map decision to proper terminal status
+    status_map = {
+        "release_to_seller": "released",
+        "refund_to_buyer": "refunded",
+        "split": "split_resolution",
+    }
+    new_status = status_map.get(req.decision, "closed")
+    tx.closed_at = now
+
+    # Atomic conditional update
     rows = db.query(EscrowTransaction).filter(
         EscrowTransaction.id == tx_id,
-        EscrowTransaction.status == "disputed"
+        EscrowTransaction.status.in_(["disputed", "under_investigation"])
     ).update({
         "status": new_status,
-        "completed_at": completed_at
+        "completed_at": now,
+        "admin_resolution": req.decision,
+        "admin_reason": req.reason.strip(),
+        "resolved_at": now,
+        "closed_at": now,
     }, synchronize_session=False)
 
     db.flush()
@@ -129,29 +163,21 @@ def resolve_dispute(
     details_str = f"Decision: {req.decision}. Reason: {req.reason.strip()}."
 
     if req.decision == "release_to_seller":
-        # Seller gets item amount minus commission
         seller_payout = tx.amount - tx.commission
         seller.wallet_balance += seller_payout
         seller.total_deals += 1
         buyer.total_deals += 1
-
         db.add(WalletTx(
-            user_id=seller.id,
-            amount=seller_payout,
-            type="escrow_release",
+            user_id=seller.id, amount=seller_payout, type="escrow_release",
             description=f"Admin dispute resolution payout for {tx.listing_title} (Tx #{tx.id})"
         ))
         details_str += f" Seller credited ₦{seller_payout:,.2f}."
 
     elif req.decision == "refund_to_buyer":
-        # Buyer gets full refund (amount + insurance)
         buyer_refund = total_pool
         buyer.wallet_balance += buyer_refund
-
         db.add(WalletTx(
-            user_id=buyer.id,
-            amount=buyer_refund,
-            type="escrow_refund",
+            user_id=buyer.id, amount=buyer_refund, type="escrow_refund",
             description=f"Admin dispute resolution refund for {tx.listing_title} (Tx #{tx.id})"
         ))
         details_str += f" Buyer refunded ₦{buyer_refund:,.2f}."
@@ -163,28 +189,21 @@ def resolve_dispute(
 
         buyer_pct = req.buyer_split_percent / 100.0
         seller_pct = 1.0 - buyer_pct
-
         buyer_share = round(total_pool * buyer_pct, 2)
         seller_share = round(total_pool * seller_pct, 2)
 
         if buyer_share > 0:
             buyer.wallet_balance += buyer_share
             db.add(WalletTx(
-                user_id=buyer.id,
-                amount=buyer_share,
-                type="escrow_refund",
+                user_id=buyer.id, amount=buyer_share, type="escrow_refund",
                 description=f"Admin dispute split refund ({req.buyer_split_percent}%) for {tx.listing_title} (Tx #{tx.id})"
             ))
-
         if seller_share > 0:
             seller.wallet_balance += seller_share
             db.add(WalletTx(
-                user_id=seller.id,
-                amount=seller_share,
-                type="escrow_release",
+                user_id=seller.id, amount=seller_share, type="escrow_release",
                 description=f"Admin dispute split payout ({100 - req.buyer_split_percent:.1f}%) for {tx.listing_title} (Tx #{tx.id})"
             ))
-
         details_str += f" Split: Buyer ₦{buyer_share:,.2f} ({req.buyer_split_percent}%), Seller ₦{seller_share:,.2f}."
 
     # Record Immutable Audit Log

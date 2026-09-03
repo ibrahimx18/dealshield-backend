@@ -107,6 +107,16 @@ class EscrowShip(BaseModel):
     logistics_provider: str = ""
     tracking_number: str = ""
 
+class EscrowDispute(BaseModel):
+    reason: str
+    evidence: Optional[str] = None  # Links, doc references, etc.
+
+class EscrowFulfill(BaseModel):
+    """Seller marks fulfilment — shipping, digital delivery, document handover, etc."""
+    logistics_provider: str = ""
+    tracking_number: str = ""
+    notes: str = ""
+
 class EscrowOut(BaseModel):
     id: Any
     listing_id: Any
@@ -125,6 +135,20 @@ class EscrowOut(BaseModel):
     logistics_provider: Optional[str] = None
     tracking_number: Optional[str] = None
     insurance_fee: float = 0
+    # New flow fields
+    accepted_at: Optional[datetime] = None
+    funded_at: Optional[datetime] = None
+    fulfilment_started_at: Optional[datetime] = None
+    buyer_review_started_at: Optional[datetime] = None
+    buyer_review_deadline: Optional[datetime] = None
+    dispute_reason: Optional[str] = None
+    dispute_initiated_by: Optional[str] = None
+    admin_resolution: Optional[str] = None
+    admin_reason: Optional[str] = None
+    resolved_at: Optional[datetime] = None
+    closed_at: Optional[datetime] = None
+    accept_deadline: Optional[datetime] = None
+    payment_deadline: Optional[datetime] = None
 
 class EscrowListResponse(BaseModel):
     transactions: List[EscrowOut]
