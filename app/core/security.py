@@ -3,7 +3,7 @@ import secrets
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
 from typing import Optional, Tuple
-from jose import JWTError, jwt
+from jwt import PyJWTError as JWTError, encode as jwt_encode, decode as jwt_decode
 from app.core.config import settings
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -28,13 +28,13 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     to_encode = data.copy()
     expire = datetime.utcnow() + (expires_delta or timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES))
     to_encode.update({"exp": expire, "type": TOKEN_TYPE_ACCESS})
-    return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+    return jwt_encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
 
 
 def decode_access_token(token: str) -> Optional[dict]:
     """Decode and validate an access token. Returns payload or None."""
     try:
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        payload = jwt_decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
         if payload.get("type") != TOKEN_TYPE_ACCESS:
             return None
         return payload
@@ -51,13 +51,13 @@ def create_refresh_token(data: dict) -> str:
     to_encode = data.copy()
     expire = datetime.utcnow() + timedelta(days=30)
     to_encode.update({"exp": expire, "type": TOKEN_TYPE_REFRESH, "jti": secrets.token_hex(16)})
-    return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+    return jwt_encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
 
 
 def decode_refresh_token(token: str) -> Optional[dict]:
     """Decode and validate a refresh token. Returns payload or None."""
     try:
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        payload = jwt_decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
         if payload.get("type") != TOKEN_TYPE_REFRESH:
             return None
         return payload
@@ -71,13 +71,13 @@ def create_email_verification_token(email: str) -> str:
     """Create a 24-hour email verification token."""
     expire = datetime.utcnow() + timedelta(hours=24)
     to_encode = {"sub": email, "exp": expire, "type": TOKEN_TYPE_EMAIL_VERIFY}
-    return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+    return jwt_encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
 
 
 def decode_email_verification_token(token: str) -> Optional[str]:
     """Decode and validate an email verification token. Returns email or None."""
     try:
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        payload = jwt_decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
         if payload.get("type") != TOKEN_TYPE_EMAIL_VERIFY:
             return None
         return payload.get("sub")
@@ -137,13 +137,13 @@ def create_2fa_temp_token(user_id: int) -> str:
     """Create a short-lived temporary JWT for the 2FA login flow (5 minutes)."""
     expire = datetime.utcnow() + timedelta(minutes=5)
     to_encode = {"sub": str(user_id), "exp": expire, "type": TOKEN_TYPE_2FA_TEMP}
-    return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+    return jwt_encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
 
 
 def decode_2fa_temp_token(token: str) -> Optional[dict]:
     """Decode and validate a 2FA temp token. Returns payload or None."""
     try:
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        payload = jwt_decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
         if payload.get("type") != TOKEN_TYPE_2FA_TEMP:
             return None
         return payload

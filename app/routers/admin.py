@@ -9,6 +9,7 @@ from app.dependencies import get_db
 from app.models.models import EscrowTransaction, User, WalletTx, AdminAuditLog
 from app.routers.auth import get_current_user
 from app.routers.escrow import CANCELLATION_FEE
+from app.core.security_middleware import sanitize_text
 from app.core.notifications import notify_escrow_event
 
 router = APIRouter()
@@ -113,6 +114,10 @@ def resolve_dispute(
     if not req.reason or len(req.reason.strip()) < 5:
         raise HTTPException(status_code=400, detail="A valid resolution reason (at least 5 characters) is required.")
 
+    # Sanitize admin input to prevent stored XSS
+    req_reason = sanitize_text(req.reason, max_length=1000)
+    req_decision = sanitize_text(req.decision, max_length=50)
+
     tx = db.query(EscrowTransaction).filter(EscrowTransaction.id == tx_id).first()
     if not tx:
         raise HTTPException(status_code=404, detail="Transaction not found")
@@ -129,8 +134,8 @@ def resolve_dispute(
         raise HTTPException(status_code=400, detail="Buyer or seller account missing for this transaction.")
 
     now = datetime.utcnow()
-    tx.admin_resolution = req.decision
-    tx.admin_reason = req.reason.strip()
+    tx.admin_resolution = req_decision
+    tx.admin_reason = req_reason
     tx.resolved_at = now
 
     # Map decision to proper terminal status
@@ -139,7 +144,7 @@ def resolve_dispute(
         "refund_to_buyer": "refunded",
         "split": "split_resolution",
     }
-    new_status = status_map.get(req.decision, "closed")
+    new_status = status_map.get(req_decision, "closed")
     tx.closed_at = now
 
     # Atomic conditional update
@@ -149,8 +154,8 @@ def resolve_dispute(
     ).update({
         "status": new_status,
         "completed_at": now,
-        "admin_resolution": req.decision,
-        "admin_reason": req.reason.strip(),
+        "admin_resolution": req_decision,
+        "admin_reason": req_reason,
         "resolved_at": now,
         "closed_at": now,
     }, synchronize_session=False)
@@ -161,9 +166,9 @@ def resolve_dispute(
         raise HTTPException(status_code=409, detail="Transaction status changed concurrently; aborting dispute resolution.")
 
     total_pool = tx.amount + (tx.facilitator_fee if tx.is_facilitated else 0) + (tx.insurance_fee or 0)
-    details_str = f"Decision: {req.decision}. Reason: {req.reason.strip()}."
+    details_str = f"Decision: {req_decision}. Reason: {req_reason}."
 
-    if req.decision == "release_to_seller":
+    if req_decision == "release_to_seller":
         if tx.is_facilitated:
             # Facilitated deal: seller gets full amount, facilitator gets 90% of fee
             seller.wallet_balance += tx.amount
@@ -197,7 +202,7 @@ def resolve_dispute(
         seller.total_deals += 1
         buyer.total_deals += 1
 
-    elif req.decision == "refund_to_buyer":
+    elif req_decision == "refund_to_buyer":
         buyer_refund = total_pool
         # Deduct flat ₦5,000 cancellation fee, credit to DealShield
         if buyer_refund > CANCELLATION_FEE:
@@ -215,7 +220,7 @@ def resolve_dispute(
         ))
         details_str += f" Buyer refunded ₦{buyer_refund:,.2f} (₦{tx.cancellation_fee:,.0f} cancellation fee deducted)."
 
-    elif req.decision == "split":
+    elif req_decision == "split":
         if req.buyer_split_percent is None or not (0 <= req.buyer_split_percent <= 100):
             db.rollback()
             raise HTTPException(status_code=400, detail="buyer_split_percent must be between 0 and 100 for split decision.")
@@ -307,7 +312,7 @@ def resolve_dispute(
     # Record Immutable Audit Log
     audit_log = AdminAuditLog(
         admin_id=admin.id,
-        action=f"resolve_dispute_{req.decision}",
+        action=f"resolve_dispute_{req_decision}",
         target_type="escrow_transaction",
         target_id=tx.id,
         details=details_str
@@ -329,7 +334,7 @@ def resolve_dispute(
 
     return {
         "status": "success",
-        "message": f"Dispute for transaction #{tx_id} resolved with decision: {req.decision}",
+        "message": f"Dispute for transaction #{tx_id} resolved with decision: {req_decision}",
         "transaction_id": tx.id,
         "new_status": tx.status,
         "details": details_str
