@@ -13,6 +13,10 @@ class Settings(BaseSettings):
     OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
     BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
     WEBHOOK_SECRET: str = os.getenv("SAFEPAY_WEBHOOK_SECRET", "")
+    # Payment provider for virtual accounts (paystack, flutterwave)
+    PAYMENT_PROVIDER: str = os.getenv("PAYMENT_PROVIDER", "paystack")
+    PAYSTACK_SECRET_KEY: str = os.getenv("PAYSTACK_SECRET_KEY", "")
+    PAYSTACK_PUBLIC_KEY: str = os.getenv("PAYSTACK_PUBLIC_KEY", "")
 
     class Config:
         env_file = ".env"

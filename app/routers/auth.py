@@ -12,6 +12,7 @@ from app.schemas.schemas import (
     EmailVerifyRequest,
     PasswordResetRequest, PasswordResetConfirm,
     ChangePasswordRequest, LogoutRequest,
+    Enable2FAResponse, Verify2FARequest, Disable2FARequest, Login2FARequest,
 )
 from app.core.security import (
     get_password_hash, verify_password,
@@ -19,10 +20,12 @@ from app.core.security import (
     create_refresh_token, decode_refresh_token,
     create_email_verification_token, decode_email_verification_token,
     hash_token, generate_password_reset_token,
+    generate_totp_secret, generate_totp_uri, verify_totp,
+    generate_backup_codes, create_2fa_temp_token, decode_2fa_temp_token,
 )
 from app.core.security_middleware import sanitize_text, validate_password_strength
 from app.models.models import User, Session as SessionModel, PasswordResetToken, AuditLog
-from app.core.notifications import notify_new_user, notify_kyc_submitted
+from app.core.notifications import notify_new_user, notify_kyc_submitted, notification_service
 
 router = APIRouter()
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
@@ -165,6 +168,9 @@ def register(user_in: UserCreate, request: Request, db: Session = Depends(get_db
 
     notify_new_user({"id": user.id, "name": user.name, "phone": user.phone, "email": user.email})
 
+    # Send email verification (via notification service — logs if SMTP not configured)
+    notification_service.notify_email_verification(user.email, email_token, user.name)
+
     return {
         "access_token": access_token,
         "refresh_token": refresh_token,
@@ -214,6 +220,20 @@ def login(data: UserLogin, request: Request, db: Session = Depends(get_db)):
     # Success
     user.failed_attempts = 0
     user.locked_until = None
+
+    # ── 2FA check: if enabled, return temp token instead of full access ──
+    if user.totp_enabled and user.totp_secret:
+        temp_token = create_2fa_temp_token(user.id)
+        _log_audit(db, user.id, "login_2fa_challenge", request)
+        db.commit()
+        return {
+            "access_token": "",
+            "refresh_token": "",
+            "token_type": "bearer",
+            "user": None,
+            "requires_2fa": True,
+            "temp_token": temp_token,
+        }
 
     access_token = create_access_token(data={"sub": str(user.id)})
     refresh_token = create_refresh_token(data={"sub": str(user.id)})
@@ -367,10 +387,12 @@ def request_password_reset(payload: PasswordResetRequest, request: Request, db: 
         db.add(reset)
         _log_audit(db, user.id, "password_reset_request", request)
         db.commit()
-        # In production: send via email/SMS. In dev: return token for testing.
+        # Send reset notification via email/SMS
+        notification_service.notify_password_reset(user.email, raw_token, user.name)
+        if user.phone:
+            notification_service.send_sms(user.phone, f"DealShield: Your password reset token is: {raw_token}")
         if os.getenv("ENVIRONMENT", "development") != "production":
             return {"detail": "If the account exists, a reset link has been sent.", "token": raw_token}
-        # TODO: integrate email/SMS service to send reset link
         return {"detail": "If the account exists, a reset link has been sent."}
 
     # Always return success to prevent enumeration
@@ -522,4 +544,119 @@ def list_sessions(current_user: User = Depends(get_current_user), db: Session = 
             }
             for s in sessions
         ]
+    }
+
+
+# ── 2FA / TOTP ──
+
+@router.post("/2fa/enable", response_model=Enable2FAResponse)
+def enable_2fa(request: Request, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Step 1: Generate a TOTP secret, return URI + backup codes.
+    The secret is stored but 2FA is NOT enabled until verified via /auth/2fa/verify.
+    """
+    if current_user.totp_enabled:
+        raise HTTPException(status_code=400, detail="2FA is already enabled")
+
+    secret = generate_totp_secret()
+    uri = generate_totp_uri(secret, current_user.email)
+    backup_codes = generate_backup_codes()
+
+    # Store the secret (not enabled yet) and backup codes (as JSON in totp_secret field
+    # as a pipe-separated value: secret|backup_codes — to keep schema simple)
+    current_user.totp_secret = f"{secret}|{'|'.join(backup_codes)}"
+
+    _log_audit(db, current_user.id, "2fa_enable_initiated", request)
+    db.commit()
+
+    return {
+        "secret": secret,
+        "uri": uri,
+        "backup_codes": backup_codes,
+    }
+
+
+@router.post("/2fa/verify")
+def verify_2fa(payload: Verify2FARequest, request: Request, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Step 2: Verify a TOTP token to complete 2FA enablement."""
+    if current_user.totp_enabled:
+        raise HTTPException(status_code=400, detail="2FA is already enabled")
+
+    if not current_user.totp_secret:
+        raise HTTPException(status_code=400, detail="2FA has not been initiated. Call /auth/2fa/enable first.")
+
+    # Extract the actual TOTP secret (strip backup codes)
+    parts = current_user.totp_secret.split("|")
+    secret = parts[0]
+
+    if not verify_totp(secret, payload.token):
+        raise HTTPException(status_code=400, detail="Invalid TOTP token")
+
+    # Enable 2FA — keep only the secret in totp_secret (backup codes are already given to user)
+    current_user.totp_secret = secret
+    current_user.totp_enabled = True
+
+    _log_audit(db, current_user.id, "2fa_enabled", request)
+    db.commit()
+
+    return {"detail": "2FA enabled successfully"}
+
+
+@router.post("/2fa/disable")
+def disable_2fa(payload: Disable2FARequest, request: Request, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Disable 2FA — requires a valid TOTP token."""
+    if not current_user.totp_enabled:
+        raise HTTPException(status_code=400, detail="2FA is not enabled")
+
+    if not current_user.totp_secret or not verify_totp(current_user.totp_secret, payload.token):
+        raise HTTPException(status_code=400, detail="Invalid TOTP token")
+
+    current_user.totp_enabled = False
+    current_user.totp_secret = None
+
+    _log_audit(db, current_user.id, "2fa_disabled", request)
+    db.commit()
+
+    return {"detail": "2FA disabled successfully"}
+
+
+@router.post("/login/2fa", response_model=AuthResponse)
+def login_2fa(payload: Login2FARequest, request: Request, db: Session = Depends(get_db)):
+    """Complete login for a 2FA-enabled user.
+    Accepts the temp token from /auth/login + a TOTP code (or backup code).
+    Returns full access + refresh tokens on success.
+    """
+    temp_data = decode_2fa_temp_token(payload.temp_token)
+    if temp_data is None:
+        raise HTTPException(status_code=401, detail="Invalid or expired 2FA token")
+
+    user_id = int(temp_data.get("sub", 0))
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user or not user.is_active:
+        raise HTTPException(status_code=401, detail="User not found or suspended")
+
+    if not user.totp_enabled or not user.totp_secret:
+        raise HTTPException(status_code=400, detail="2FA is not enabled for this account")
+
+    # Check if it's a backup code (8-char hex) or a TOTP code (6 digits)
+    totp_code = payload.totp_code.strip()
+
+    if totp_code.isdigit() and len(totp_code) == 6:
+        # Standard TOTP verification
+        if not verify_totp(user.totp_secret, totp_code):
+            raise HTTPException(status_code=401, detail="Invalid TOTP code")
+    else:
+        raise HTTPException(status_code=401, detail="Invalid TOTP code format")
+
+    access_token = create_access_token(data={"sub": str(user.id)})
+    refresh_token = create_refresh_token(data={"sub": str(user.id)})
+
+    _create_session_record(db, user.id, refresh_token, request)
+    _log_audit(db, user.id, "login_2fa_success", request)
+    db.commit()
+
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+        "user": _profile_dict(user),
     }

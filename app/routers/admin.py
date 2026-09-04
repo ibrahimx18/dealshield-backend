@@ -163,15 +163,38 @@ def resolve_dispute(
     details_str = f"Decision: {req.decision}. Reason: {req.reason.strip()}."
 
     if req.decision == "release_to_seller":
-        seller_payout = tx.amount - tx.commission
-        seller.wallet_balance += seller_payout
+        if tx.is_facilitated:
+            # Facilitated deal: seller gets full amount, facilitator gets 90% of fee
+            seller.wallet_balance += tx.amount
+            db.add(WalletTx(
+                user_id=seller.id, amount=tx.amount, type="escrow_release",
+                description=f"Admin dispute resolution payout for {tx.listing_title} (Tx #{tx.id}, facilitated)"
+            ))
+            # Pay facilitator 90% of their fee
+            if tx.facilitator_fee and tx.facilitator_fee > 0 and tx.facilitator_id:
+                dealshield_cut = round(tx.facilitator_fee * 0.10, 2)
+                facilitator_payout = round(tx.facilitator_fee * 0.90, 2)
+                tx.dealshield_cut = dealshield_cut
+                tx.facilitator_payout = facilitator_payout
+                facilitator = db.query(User).filter(User.id == tx.facilitator_id).first()
+                if facilitator:
+                    facilitator.wallet_balance += facilitator_payout
+                    db.add(WalletTx(
+                        user_id=facilitator.id, amount=facilitator_payout, type="facilitator_payout",
+                        description=f"Admin dispute resolution facilitator payout for {tx.listing_title} (Tx #{tx.id})"
+                    ))
+            details_str += f" Seller credited ₦{tx.amount:,.2f} (facilitated)."
+        else:
+            # Normal deal: seller gets amount minus commission
+            seller_payout = tx.amount - tx.commission
+            seller.wallet_balance += seller_payout
+            db.add(WalletTx(
+                user_id=seller.id, amount=seller_payout, type="escrow_release",
+                description=f"Admin dispute resolution payout for {tx.listing_title} (Tx #{tx.id})"
+            ))
+            details_str += f" Seller credited ₦{seller_payout:,.2f}."
         seller.total_deals += 1
         buyer.total_deals += 1
-        db.add(WalletTx(
-            user_id=seller.id, amount=seller_payout, type="escrow_release",
-            description=f"Admin dispute resolution payout for {tx.listing_title} (Tx #{tx.id})"
-        ))
-        details_str += f" Seller credited ₦{seller_payout:,.2f}."
 
     elif req.decision == "refund_to_buyer":
         buyer_refund = total_pool
@@ -189,22 +212,67 @@ def resolve_dispute(
 
         buyer_pct = req.buyer_split_percent / 100.0
         seller_pct = 1.0 - buyer_pct
-        buyer_share = round(total_pool * buyer_pct, 2)
-        seller_share = round(total_pool * seller_pct, 2)
 
-        if buyer_share > 0:
-            buyer.wallet_balance += buyer_share
-            db.add(WalletTx(
-                user_id=buyer.id, amount=buyer_share, type="escrow_refund",
-                description=f"Admin dispute split refund ({req.buyer_split_percent}%) for {tx.listing_title} (Tx #{tx.id})"
-            ))
-        if seller_share > 0:
-            seller.wallet_balance += seller_share
-            db.add(WalletTx(
-                user_id=seller.id, amount=seller_share, type="escrow_release",
-                description=f"Admin dispute split payout ({100 - req.buyer_split_percent:.1f}%) for {tx.listing_title} (Tx #{tx.id})"
-            ))
-        details_str += f" Split: Buyer ₦{buyer_share:,.2f} ({req.buyer_split_percent}%), Seller ₦{seller_share:,.2f}."
+        # For facilitated deals: split the deal amount between buyer and seller,
+        # and reduce facilitator fee proportionally (seller's portion goes to facilitator)
+        if tx.is_facilitated:
+            deal_amount = tx.amount
+            facilitator_fee = tx.facilitator_fee or 0
+            facilitator_payout = 0.0  # default
+
+            # Buyer gets their share of the deal amount back
+            buyer_share = round(deal_amount * buyer_pct, 2)
+            # Seller gets their share of the deal amount
+            seller_share = round(deal_amount * seller_pct, 2)
+
+            # Facilitator fee is reduced proportionally — facilitator gets
+            # seller_pct of their fee (since seller is the one fulfilling)
+            facilitator_fee_portion = round(facilitator_fee * seller_pct, 2)
+            if facilitator_fee_portion > 0 and tx.facilitator_id:
+                dealshield_cut = round(facilitator_fee_portion * 0.10, 2)
+                facilitator_payout = round(facilitator_fee_portion * 0.90, 2)
+                tx.dealshield_cut = dealshield_cut
+                tx.facilitator_payout = facilitator_payout
+                facilitator = db.query(User).filter(User.id == tx.facilitator_id).first()
+                if facilitator:
+                    facilitator.wallet_balance += facilitator_payout
+                    db.add(WalletTx(
+                        user_id=facilitator.id, amount=facilitator_payout, type="facilitator_payout",
+                        description=f"Admin split facilitator payout ({seller_pct*100:.1f}% of fee) for {tx.listing_title} (Tx #{tx.id})"
+                    ))
+
+            if buyer_share > 0:
+                buyer.wallet_balance += buyer_share
+                db.add(WalletTx(
+                    user_id=buyer.id, amount=buyer_share, type="escrow_refund",
+                    description=f"Admin split refund ({req.buyer_split_percent}%) for {tx.listing_title} (Tx #{tx.id})"
+                ))
+            if seller_share > 0:
+                seller.wallet_balance += seller_share
+                db.add(WalletTx(
+                    user_id=seller.id, amount=seller_share, type="escrow_release",
+                    description=f"Admin split payout ({seller_pct*100:.1f}%) for {tx.listing_title} (Tx #{tx.id})"
+                ))
+            details_str += f" Split (facilitated): Buyer ₦{buyer_share:,.2f} ({req.buyer_split_percent}%), Seller ₦{seller_share:,.2f}, Facilitator ₦{facilitator_payout:,.2f}."
+
+        else:
+            # Normal deal: split the total pool
+            buyer_share = round(total_pool * buyer_pct, 2)
+            seller_share = round(total_pool * seller_pct, 2)
+
+            if buyer_share > 0:
+                buyer.wallet_balance += buyer_share
+                db.add(WalletTx(
+                    user_id=buyer.id, amount=buyer_share, type="escrow_refund",
+                    description=f"Admin dispute split refund ({req.buyer_split_percent}%) for {tx.listing_title} (Tx #{tx.id})"
+                ))
+            if seller_share > 0:
+                seller.wallet_balance += seller_share
+                db.add(WalletTx(
+                    user_id=seller.id, amount=seller_share, type="escrow_release",
+                    description=f"Admin dispute split payout ({100 - req.buyer_split_percent:.1f}%) for {tx.listing_title} (Tx #{tx.id})"
+                ))
+            details_str += f" Split: Buyer ₦{buyer_share:,.2f} ({req.buyer_split_percent}%), Seller ₦{seller_share:,.2f}."
 
     # Record Immutable Audit Log
     audit_log = AdminAuditLog(

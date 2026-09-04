@@ -101,3 +101,51 @@ def generate_password_reset_token() -> Tuple[str, str]:
     raw_token = secrets.token_urlsafe(32)
     token_hash = hash_token(raw_token)
     return raw_token, token_hash
+
+
+# ── TOTP / 2FA ──
+
+TOKEN_TYPE_2FA_TEMP = "2fa_temp"
+
+
+def generate_totp_secret() -> str:
+    """Generate a random base32 TOTP secret."""
+    import pyotp
+    return pyotp.random_base32()
+
+
+def generate_totp_uri(secret: str, email: str, issuer: str = "DealShield") -> str:
+    """Generate an otpauth:// URI for QR code provisioning."""
+    import pyotp
+    totp = pyotp.TOTP(secret)
+    return totp.provisioning_uri(name=email, issuer_name=issuer)
+
+
+def verify_totp(secret: str, token: str) -> bool:
+    """Verify a TOTP token against the secret. Returns True if valid."""
+    import pyotp
+    totp = pyotp.TOTP(secret)
+    return totp.verify(token, valid_window=1)
+
+
+def generate_backup_codes(count: int = 10) -> list[str]:
+    """Generate one-time backup codes (8-char alphanumeric)."""
+    return [secrets.token_hex(4).upper() for _ in range(count)]
+
+
+def create_2fa_temp_token(user_id: int) -> str:
+    """Create a short-lived temporary JWT for the 2FA login flow (5 minutes)."""
+    expire = datetime.utcnow() + timedelta(minutes=5)
+    to_encode = {"sub": str(user_id), "exp": expire, "type": TOKEN_TYPE_2FA_TEMP}
+    return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+
+
+def decode_2fa_temp_token(token: str) -> Optional[dict]:
+    """Decode and validate a 2FA temp token. Returns payload or None."""
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        if payload.get("type") != TOKEN_TYPE_2FA_TEMP:
+            return None
+        return payload
+    except JWTError:
+        return None

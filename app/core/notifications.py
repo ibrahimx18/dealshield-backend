@@ -1,128 +1,191 @@
 """
-SafePay Notification System
-Handles webhook triggers to n8n and Telegram notifications.
-n8n picks up events via webhook and processes them.
+DealShield Notification Service
+Sends email and SMS notifications for key escrow events.
+Supports SMTP for email and Twilio/Termii for SMS (Nigerian provider).
+Providers are configured via environment variables and fail silently if not set.
 """
 import os
-import json
-import logging
-import requests
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from typing import Optional
+import logging
 
-logger = logging.getLogger("safepay.notifications")
-
-# ── Configuration ──
-# n8n webhook base URL for SafePay events
-N8N_WEBHOOK_BASE = os.getenv("N8N_WEBHOOK_BASE", "http://localhost:5678/webhook")
-# No insecure fallback — app.main.validate_required_secrets() enforces this is set at startup.
-SAFEPAY_WEBHOOK_SECRET = os.getenv("SAFEPAY_WEBHOOK_SECRET", "")
-
-# Telegram bot token (for direct sends if n8n is down)
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-GERALT_TELEGRAM_CHAT_ID = os.getenv("GERALT_TELEGRAM_CHAT_ID", "1224185098")
+logger = logging.getLogger("dealshield.notifications")
 
 
-def trigger_webhook(event_type: str, data: dict) -> bool:
-    """
-    Fire a webhook to n8n for a SafePay event.
-    n8n will handle the actual notification routing (Telegram, email, etc.)
-    """
-    payload = {
-        "event": event_type,
-        "secret": SAFEPAY_WEBHOOK_SECRET,
-        "data": data,
-    }
-    webhook_url = f"{N8N_WEBHOOK_BASE}/safepay-{event_type}"
+class NotificationService:
+    """Sends email and SMS notifications. Falls back to logging if providers not configured."""
 
-    try:
-        resp = requests.post(webhook_url, json=payload, timeout=5)
-        if resp.status_code in (200, 201):
-            logger.info(f"Webhook triggered: {event_type}")
+    def __init__(self):
+        self.smtp_host = os.getenv("SMTP_HOST")
+        self.smtp_port = int(os.getenv("SMTP_PORT", "587"))
+        self.smtp_user = os.getenv("SMTP_USER")
+        self.smtp_pass = os.getenv("SMTP_PASS")
+        self.from_email = os.getenv("FROM_EMAIL", "noreply@dealshield.ng")
+        self.from_name = os.getenv("FROM_NAME", "DealShield")
+
+        # SMS provider: 'termii' (Nigerian) or 'twilio'
+        self.sms_provider = os.getenv("SMS_PROVIDER", "termii")
+        self.termii_api_key = os.getenv("TERMII_API_KEY")
+        self.termii_sender = os.getenv("TERMII_SENDER", "DealShield")
+        self.twilio_sid = os.getenv("TWILIO_SID")
+        self.twilio_token = os.getenv("TWILIO_TOKEN")
+        self.twilio_from = os.getenv("TWILIO_FROM")
+
+    def send_email(self, to_email: str, subject: str, body: str, html: Optional[str] = None):
+        """Send an email notification. Logs if SMTP not configured."""
+        if not self.smtp_host:
+            logger.info(f"[EMAIL] (no SMTP configured) To: {to_email}, Subject: {subject}")
+            logger.info(f"[EMAIL] Body: {body[:200]}")
+            return False
+
+        try:
+            msg = MIMEMultipart("alternative")
+            msg["From"] = f"{self.from_name} <{self.from_email}>"
+            msg["To"] = to_email
+            msg["Subject"] = subject
+            msg.attach(MIMEText(body, "plain"))
+            if html:
+                msg.attach(MIMEText(html, "html"))
+
+            with smtplib.SMTP(self.smtp_host, self.smtp_port) as server:
+                server.starttls()
+                server.login(self.smtp_user, self.smtp_pass)
+                server.sendmail(self.from_email, to_email, msg.as_string())
+            logger.info(f"[EMAIL] Sent to {to_email}: {subject}")
             return True
-        else:
-            logger.warning(f"Webhook {event_type} returned {resp.status_code}")
-    except requests.exceptions.RequestException as e:
-        logger.warning(f"Webhook {event_type} failed: {e}")
+        except Exception as e:
+            logger.error(f"[EMAIL] Failed to send to {to_email}: {e}")
+            return False
 
-    # Fallback: try direct Telegram message if n8n is down
-    if TELEGRAM_BOT_TOKEN:
-        _send_telegram_fallback(event_type, data)
-    return False
+    def send_sms(self, phone: str, message: str):
+        """Send an SMS notification. Logs if SMS provider not configured."""
+        if not self._sms_configured():
+            logger.info(f"[SMS] (no provider configured) To: {phone}, Message: {message[:200]}")
+            return False
+
+        try:
+            if self.sms_provider == "termii":
+                return self._send_termii(phone, message)
+            elif self.sms_provider == "twilio":
+                return self._send_twilio(phone, message)
+        except Exception as e:
+            logger.error(f"[SMS] Failed to send to {phone}: {e}")
+            return False
+
+    def _sms_configured(self) -> bool:
+        if self.sms_provider == "termii":
+            return bool(self.termii_api_key)
+        elif self.sms_provider == "twilio":
+            return bool(self.twilio_sid and self.twilio_token)
+        return False
+
+    def _send_termii(self, phone: str, message: str) -> bool:
+        import requests
+        url = "https://api.ng.termii.com/api/sms/send"
+        payload = {
+            "to": phone,
+            "from": self.termii_sender,
+            "sms": message,
+            "type": "plain",
+            "channel": "generic",
+            "api_key": self.termii_api_key,
+        }
+        resp = requests.post(url, json=payload, timeout=10)
+        return resp.status_code == 200
+
+    def _send_twilio(self, phone: str, message: str) -> bool:
+        from twilio.rest import Client
+        client = Client(self.twilio_sid, self.twilio_token)
+        client.messages.create(body=message, from_=self.twilio_from, to=phone)
+        return True
+
+    # ── Templated notifications ──
+
+    def notify_email_verification(self, email: str, token: str, name: str = ""):
+        """Send email verification link."""
+        subject = "Verify Your DealShield Account"
+        body = f"""Hello {name},
+
+Please verify your email address to secure your DealShield account.
+
+Your verification token is: {token}
+
+If you did not create this account, please ignore this email.
+
+— DealShield Team
+"""
+        self.send_email(email, subject, body)
+
+    def notify_password_reset(self, email: str, token: str, name: str = ""):
+        """Send password reset link."""
+        subject = "Reset Your DealShield Password"
+        body = f"""Hello {name},
+
+We received a request to reset your DealShield password.
+
+Your reset token is: {token}
+
+This token expires in 30 minutes. If you did not request this, please ignore this email.
+
+— DealShield Team
+"""
+        self.send_email(email, subject, body)
+
+    def notify_escrow_status(self, phone: str, email: str, tx_title: str, status: str, role: str):
+        """Send escrow status update via SMS and email."""
+        messages = {
+            "created": f"DealShield: A new deal '{tx_title}' has been created. You are the {role}.",
+            "seller_accepted": f"DealShield: Deal '{tx_title}' accepted by seller. Please fund within 24h.",
+            "funded": f"DealShield: Deal '{tx_title}' has been funded. Seller can now fulfil.",
+            "seller_fulfilling": f"DealShield: Seller has started fulfilment for '{tx_title}'.",
+            "buyer_review": f"DealShield: Goods delivered for '{tx_title}'. You have 7 days to review.",
+            "released": f"DealShield: Funds released for '{tx_title}'. Transaction complete.",
+            "disputed": f"DealShield: Dispute raised for '{tx_title}'. Our team will investigate.",
+            "under_investigation": f"DealShield: Your dispute for '{tx_title}' is under investigation.",
+            "resolved": f"DealShield: Dispute for '{tx_title}' has been resolved.",
+            "cancelled": f"DealShield: Deal '{tx_title}' has been cancelled.",
+            "expired": f"DealShield: Deal '{tx_title}' has expired (deadline passed).",
+        }
+        msg = messages.get(status, f"DealShield: Your deal '{tx_title}' status updated to {status}.")
+        self.send_sms(phone, msg)
+        self.send_email(email, f"DealShield Update: {tx_title}", msg)
+
+    def notify_2fa_enabled(self, phone: str, email: str):
+        """Confirm 2FA was enabled."""
+        msg = "DealShield: Two-factor authentication has been enabled on your account."
+        self.send_sms(phone, msg)
+        self.send_email(email, "2FA Enabled on DealShield", msg)
 
 
-def _send_telegram_fallback(event_type: str, data: dict):
-    """Send a basic Telegram message directly if n8n is unavailable."""
-    try:
-        msg = _format_telegram_message(event_type, data)
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        requests.post(url, json={
-            "chat_id": GERALT_TELEGRAM_CHAT_ID,
-            "text": msg,
-            "parse_mode": "HTML",
-        }, timeout=5)
-    except Exception as e:
-        logger.error(f"Telegram fallback failed: {e}")
+notification_service = NotificationService()
 
 
-def _format_telegram_message(event_type: str, data: dict) -> str:
-    """Format a basic notification message for Telegram."""
-    emoji_map = {
-        "escrow_created": "🛡️",
-        "escrow_shipped": "📦",
-        "escrow_delivered": "✅",
-        "escrow_disputed": "⚠️",
-        "escrow_cancelled": "❌",
-        "listing_created": "📝",
-        "price_alert": "📈",
-        "low_wallet": "💰",
-        "new_user": "👤",
-        "kyc_submitted": "🪪",
-    }
-    emoji = emoji_map.get(event_type, "🔔")
-
-    lines = [f"{emoji} <b>SafePay: {event_type.replace('_', ' ').title()}</b>"]
-    for key, val in data.items():
-        lines.append(f"<b>{key}:</b> {val}")
-    return "\n".join(lines)
-
-
-# ── Event-specific helpers ──
-
-def notify_escrow_event(tx_data: dict, event_type: str):
-    """Notify about escrow status changes."""
-    trigger_webhook(event_type, {
-        "transaction_id": tx_data.get("id"),
-        "listing_title": tx_data.get("listing_title"),
-        "category": tx_data.get("category"),
-        "amount": tx_data.get("amount"),
-        "commission": tx_data.get("commission"),
-        "status": tx_data.get("status"),
-        "buyer_name": tx_data.get("buyer_name"),
-        "seller_name": tx_data.get("seller_name"),
-        "buyer_id": tx_data.get("buyer_id"),
-        "seller_id": tx_data.get("seller_id"),
-        "insured": tx_data.get("insured"),
-        "insurance_fee": tx_data.get("insurance_fee", 0),
-        "logistics_provider": tx_data.get("logistics_provider", ""),
-        "tracking_number": tx_data.get("tracking_number", ""),
-    })
-
-
-def notify_listing_event(listing_data: dict):
-    """Notify about new listing creation (for scam detection)."""
-    trigger_webhook("listing_created", listing_data)
-
+# ── Compatibility functions (used by existing routers) ──
 
 def notify_new_user(user_data: dict):
-    """Notify about new user registration."""
-    trigger_webhook("new_user", user_data)
+    """Called when a new user registers."""
+    notification_service.send_email(
+        user_data.get("email", ""),
+        "Welcome to DealShield",
+        f"Welcome {user_data.get('name', '')}! Your DealShield account has been created."
+    )
 
+def notify_kyc_submitted(data: dict):
+    """Called when KYC is submitted."""
+    notification_service.send_email(
+        data.get("email", "noreply@dealshield.ng"),
+        "KYC Submission Received",
+        f"Hello {data.get('name', '')}, we received your KYC submission."
+    )
 
-def notify_kyc_submitted(user_data: dict):
-    """Notify when a user submits KYC verification."""
-    trigger_webhook("kyc_submitted", user_data)
+def notify_listing_event(listing_data: dict, event: str):
+    """Called when a listing is created/updated/deleted."""
+    logger.info(f"[LISTING] Event: {event}, Data: {listing_data}")
 
-
-def notify_low_wallet(user_data: dict):
-    """Notify when user wallet balance is low."""
-    trigger_webhook("low_wallet", user_data)
+def notify_escrow_event(tx_data: dict, event: str):
+    """Called when an escrow transaction status changes."""
+    logger.info(f"[ESCROW] Event: {event}, Tx: {tx_data.get('id')}, Status: {tx_data.get('status')}")
+    # In production, this would send SMS/email to buyer + seller
+    # For now, it just logs. The notification_service handles actual delivery.

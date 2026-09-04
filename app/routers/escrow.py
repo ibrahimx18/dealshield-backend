@@ -11,12 +11,18 @@ Flow:
   Exit paths: CANCELLED (before funding), EXPIRED (deadlines), CLOSED (terminal)
 """
 import json
-from fastapi import APIRouter, Depends, HTTPException, Request
+import random
+import hashlib
+import hmac
+from fastapi import APIRouter, Depends, HTTPException, Request, Header
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
 from app.dependencies import get_db
-from app.schemas.schemas import EscrowCreate, EscrowShip, EscrowOut, EscrowListResponse, EscrowDispute, EscrowFulfill, FacilitatedDealCreate, FacilitatorAcceptTerms
-from app.models.models import EscrowTransaction, User, Listing, WalletTx, AuditLog
+from app.schemas.schemas import (
+    EscrowCreate, EscrowShip, EscrowOut, EscrowListResponse, EscrowDispute,
+    EscrowFulfill, FacilitatedDealCreate, FacilitatorAcceptTerms, VirtualAccountOut,
+)
+from app.models.models import EscrowTransaction, User, Listing, WalletTx, AuditLog, VirtualAccount
 from app.routers.auth import get_current_user, _update_badge
 from app.core.config import settings
 from app.core.notifications import notify_escrow_event
@@ -26,11 +32,19 @@ router = APIRouter()
 
 # Insurance fee: 1.5% of item value
 INSURANCE_RATE = 0.015
+# Gateway fee: 1.5% of total (Paystack/Flutterwave standard), capped at ₦50,000
+GATEWAY_FEE_RATE = 0.015
+GATEWAY_FEE_CAP = 50000.0
 
 # Deadline constants
 ACCEPT_DEADLINE_HOURS = 48       # Seller must accept within 48h
 PAYMENT_DEADLINE_HOURS = 24      # Buyer must fund within 24h after seller accepts
 BUYER_REVIEW_DAYS = 7            # Auto-release after 7 days if buyer is silent
+
+
+def _calc_gateway_fee(amount: float) -> float:
+    """Calculate payment gateway fee: 1.5% of amount, capped at ₦50,000."""
+    return round(min(amount * GATEWAY_FEE_RATE, GATEWAY_FEE_CAP), 2)
 
 
 def _tx_dict(tx: EscrowTransaction) -> dict:
@@ -71,8 +85,14 @@ def _tx_dict(tx: EscrowTransaction) -> dict:
         "facilitator_fee": tx.facilitator_fee or 0.0,
         "dealshield_cut": tx.dealshield_cut or 0.0,
         "facilitator_payout": tx.facilitator_payout or 0.0,
+        "gateway_fee": tx.gateway_fee or 0.0,
+        "buyer_gateway_share": tx.buyer_gateway_share or 0.0,
+        "seller_gateway_share": tx.seller_gateway_share or 0.0,
         "buyer_accepted_terms": tx.buyer_accepted_terms,
         "seller_accepted_terms": tx.seller_accepted_terms,
+        "gateway_fee": tx.gateway_fee or 0.0,
+        "buyer_gateway_share": tx.buyer_gateway_share or 0.0,
+        "seller_gateway_share": tx.seller_gateway_share or 0.0,
     }
 
 
@@ -111,13 +131,15 @@ def _release_funds(db: Session, tx: EscrowTransaction):
 
     if tx.is_facilitated:
         # Facilitated deal: no escrow commission, facilitator fee is split 90/10
-        seller.wallet_balance += tx.amount  # full deal amount to seller
+        # Seller gateway share is deducted from payout
+        seller_payout = tx.amount - (tx.seller_gateway_share or 0)
+        seller.wallet_balance += seller_payout
         seller.total_deals += 1
         buyer.total_deals += 1
         _update_badge(seller)
         _update_badge(buyer)
         db.add(WalletTx(
-            user_id=seller.id, amount=tx.amount, type="escrow_release",
+            user_id=seller.id, amount=seller_payout, type="escrow_release",
             description=f"Escrow release for {tx.listing_title} (facilitated)"
         ))
 
@@ -137,30 +159,31 @@ def _release_funds(db: Session, tx: EscrowTransaction):
                         description=f"Facilitator payout for {tx.listing_title} (90% of ₦{tx.facilitator_fee:,.0f} fee)"
                     ))
     else:
-        # Normal deal: seller gets amount minus commission
-        seller.wallet_balance += tx.amount - tx.commission
+        # Normal deal: seller gets amount minus commission minus seller gateway share
+        seller_payout = tx.amount - tx.commission - (tx.seller_gateway_share or 0)
+        seller.wallet_balance += seller_payout
         seller.total_deals += 1
         buyer.total_deals += 1
         _update_badge(seller)
         _update_badge(buyer)
         db.add(WalletTx(
-            user_id=seller.id, amount=tx.amount - tx.commission, type="escrow_release",
+            user_id=seller.id, amount=seller_payout, type="escrow_release",
             description=f"Escrow release for {tx.listing_title}"
         ))
 
 
 def _refund_buyer(db: Session, tx: EscrowTransaction, partial_amount: float | None = None):
     """Refund buyer (full or partial).
-    Facilitated deal: refund = deal_amount + facilitator_fee + insurance.
-    Normal deal: refund = amount + insurance.
+    Facilitated deal: refund = deal_amount + facilitator_fee + insurance + buyer_gateway_share.
+    Normal deal: refund = amount + insurance + buyer_gateway_share.
     """
     buyer = db.query(User).filter(User.id == tx.buyer_id).first()
     if partial_amount is not None:
         refund = partial_amount
     elif tx.is_facilitated:
-        refund = tx.amount + tx.facilitator_fee + (tx.insurance_fee or 0)
+        refund = tx.amount + tx.facilitator_fee + (tx.insurance_fee or 0) + (tx.buyer_gateway_share or 0)
     else:
-        refund = tx.amount + (tx.insurance_fee or 0)
+        refund = tx.amount + (tx.insurance_fee or 0) + (tx.buyer_gateway_share or 0)
     buyer.wallet_balance += refund
     db.add(WalletTx(
         user_id=buyer.id, amount=refund, type="escrow_refund",
@@ -296,36 +319,49 @@ def fund_escrow(tx_id: int, request: Request,
         db.commit()
         raise HTTPException(status_code=400, detail="Payment deadline expired")
 
-    # Calculate total buyer must pay
+    # Calculate total buyer must pay (before gateway fee)
     if tx.is_facilitated:
         total = tx.amount + tx.facilitator_fee + (tx.insurance_fee or 0)
     else:
         total = tx.amount + (tx.insurance_fee or 0)
 
-    if current_user.wallet_balance < total:
+    # Calculate gateway fee on the total, split 50/50 between buyer and seller
+    gateway_fee = _calc_gateway_fee(total)
+    buyer_gateway_share = round(gateway_fee / 2, 2)
+    seller_gateway_share = round(gateway_fee - buyer_gateway_share, 2)
+
+    # Buyer total payment includes their gateway share
+    total_with_gateway = total + buyer_gateway_share
+
+    if current_user.wallet_balance < total_with_gateway:
         raise HTTPException(
             status_code=400,
-            detail=f"Insufficient wallet balance. Need ₦{total:,.0f}. Please deposit funds first."
+            detail=f"Insufficient wallet balance. Need ₦{total_with_gateway:,.0f}. Please deposit funds first."
         )
 
     # Atomic conditional update to prevent double-funding
     rows = db.query(EscrowTransaction).filter(
         EscrowTransaction.id == tx_id,
         EscrowTransaction.status == "seller_accepted",
-    ).update({"status": "funded", "funded_at": now}, synchronize_session=False)
+    ).update({
+        "status": "funded", "funded_at": now,
+        "gateway_fee": gateway_fee,
+        "buyer_gateway_share": buyer_gateway_share,
+        "seller_gateway_share": seller_gateway_share,
+    }, synchronize_session=False)
     db.flush()
     if rows != 1:
         db.rollback()
         raise HTTPException(status_code=409, detail="Transaction status changed concurrently")
 
-    current_user.wallet_balance -= total
+    current_user.wallet_balance -= total_with_gateway
     db.add(WalletTx(
-        user_id=current_user.id, amount=-total, type="escrow_hold",
-        description=f"Escrow deposit for {tx.listing_title}" + (" (insured)" if tx.insured else "")
+        user_id=current_user.id, amount=-total_with_gateway, type="escrow_hold",
+        description=f"Escrow deposit for {tx.listing_title}" + (", insured" if tx.insured else "")
     ))
 
     _log_audit(db, current_user.id, "escrow_fund", request, target_id=tx.id,
-               details=f"Amount: {total}")
+               details=f"Amount: {total_with_gateway} (gateway fee: {gateway_fee})")
     db.commit()
     db.refresh(tx)
     notify_escrow_event(_tx_dict(tx), "escrow_funded")
@@ -802,3 +838,238 @@ def confirm_receipt_legacy(tx_id: int, request: Request,
         tx.buyer_review_deadline = now + timedelta(days=BUYER_REVIEW_DAYS)
         db.flush()
     return buyer_approve(tx_id, request, current_user, db)
+
+
+# ── VIRTUAL ACCOUNT ENDPOINTS ──
+
+def _generate_account_number() -> str:
+    """Generate a 10-digit NUBAN-format account number.
+
+    NUBAN format: 9-digit serial + 1 checksum digit.
+    The checksum is computed using the standard CBN NUBAN algorithm:
+    for a 9-digit serial N = n1 n2 ... n9, checksum = (3*n1 + 7*n2 + 3*n3 + 3*n4 + 7*n5 + 3*n6 + 3*n7 + 7*n8 + 3*n9) mod 10, then 10 - result mod 10.
+    """
+    serial = random.randint(100000000, 999999999)  # 9-digit serial
+    digits = [int(d) for d in str(serial)]
+    # NUBAN check digit algorithm (CBN standard)
+    weights = [3, 7, 3, 3, 7, 3, 3, 7, 3]
+    check_sum = sum(w * d for w, d in zip(weights, digits))
+    check_digit = (10 - (check_sum % 10)) % 10
+    return f"{serial}{check_digit}"
+
+
+def _va_dict(va: VirtualAccount) -> dict:
+    return {
+        "id": va.id,
+        "escrow_tx_id": va.escrow_tx_id,
+        "account_number": va.account_number,
+        "bank_name": va.bank_name,
+        "bank_code": va.bank_code,
+        "account_name": va.account_name,
+        "provider": va.provider,
+        "status": va.status,
+        "expected_amount": va.expected_amount,
+        "expires_at": va.expires_at.isoformat() if va.expires_at else None,
+        "created_at": va.created_at.isoformat() if va.created_at else None,
+        "updated_at": va.updated_at.isoformat() if va.updated_at else None,
+    }
+
+
+@router.post("/{tx_id}/generate-account", response_model=VirtualAccountOut)
+def generate_virtual_account(tx_id: int, request: Request,
+                             current_user: User = Depends(get_current_user),
+                             db: Session = Depends(get_db)):
+    """Generate a dedicated virtual account for an escrow transaction.
+    The buyer can transfer the exact expected amount directly to this account.
+    The account auto-expires when the payment deadline passes.
+    """
+    tx = db.query(EscrowTransaction).filter(EscrowTransaction.id == tx_id).first()
+    if not tx:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    if tx.buyer_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Only the buyer can generate a virtual account")
+    if tx.status not in ("seller_accepted", "payment_pending", "created"):
+        raise HTTPException(status_code=400, detail=f"Cannot generate account — current status: {tx.status}")
+
+    # Check if a virtual account already exists for this transaction
+    existing = db.query(VirtualAccount).filter(
+        VirtualAccount.escrow_tx_id == tx_id,
+        VirtualAccount.status == "active",
+    ).first()
+    if existing:
+        # Return existing account
+        return _va_dict(existing)
+
+    # Calculate total buyer must pay
+    if tx.is_facilitated:
+        total = tx.amount + tx.facilitator_fee + (tx.insurance_fee or 0)
+    else:
+        total = tx.amount + (tx.insurance_fee or 0)
+
+    # Generate unique account number
+    for _ in range(10):
+        acct_no = _generate_account_number()
+        if not db.query(VirtualAccount).filter(VirtualAccount.account_number == acct_no).first():
+            break
+    else:
+        raise HTTPException(status_code=500, detail="Failed to generate unique account number")
+
+    # Set expiry to payment deadline
+    expires_at = tx.payment_deadline
+
+    va = VirtualAccount(
+        escrow_tx_id=tx_id,
+        account_number=acct_no,
+        bank_name="DealShield MFB",
+        bank_code="999",
+        account_name=f"DEALSHIELD/{current_user.name}/{tx_id}",
+        provider=settings.PAYMENT_PROVIDER,
+        status="active",
+        expected_amount=total,
+        expires_at=expires_at,
+    )
+    db.add(va)
+
+    # If the escrow is in 'created' or 'seller_accepted', set it to 'payment_pending'
+    if tx.status in ("created", "seller_accepted"):
+        tx.status = "payment_pending"
+
+    _log_audit(db, current_user.id, "virtual_account_generate", request,
+               target_id=tx_id, details=f"Account: {acct_no}, Amount: {total}")
+    db.commit()
+    db.refresh(va)
+    return _va_dict(va)
+
+
+@router.get("/{tx_id}/account", response_model=VirtualAccountOut)
+def get_virtual_account(tx_id: int,
+                        current_user: User = Depends(get_current_user),
+                        db: Session = Depends(get_db)):
+    """Get the virtual account details for a transaction."""
+    tx = db.query(EscrowTransaction).filter(EscrowTransaction.id == tx_id).first()
+    if not tx:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    if current_user.id not in (tx.buyer_id, tx.seller_id):
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    va = db.query(VirtualAccount).filter(
+        VirtualAccount.escrow_tx_id == tx_id,
+    ).order_by(VirtualAccount.created_at.desc()).first()
+    if not va:
+        raise HTTPException(status_code=404, detail="No virtual account for this transaction")
+
+    # Auto-expire if payment deadline has passed
+    now = datetime.utcnow()
+    if va.status == "active" and va.expires_at and now > va.expires_at:
+        va.status = "expired"
+        db.commit()
+        db.refresh(va)
+
+    return _va_dict(va)
+
+
+@router.post("/webhook/payment")
+async def escrow_payment_webhook(request: Request,
+                                  x_paystack_signature: str = Header(None, alias="x-paystack-signature"),
+                                  db: Session = Depends(get_db)):
+    """Webhook endpoint for payment provider (Paystack) to notify us when
+    a virtual account receives funds. Validates the webhook signature,
+    matches the payment to an escrow transaction by account number, and
+    marks the escrow as funded.
+
+    This is a placeholder — in production, integrate with Paystack's
+    dedicated NUBAN virtual account API for real signature verification.
+    """
+    body = await request.body()
+    body_text = body.decode("utf-8") if body else ""
+
+    # Validate webhook signature
+    secret = settings.PAYSTACK_SECRET_KEY or settings.WEBHOOK_SECRET
+    if not secret:
+        raise HTTPException(status_code=503, detail="Payment provider not configured")
+
+    computed_signature = hmac.new(
+        secret.encode("utf-8"),
+        body,
+        hashlib.sha512,
+    ).hexdigest()
+
+    if not x_paystack_signature or not hmac.compare_digest(computed_signature, x_paystack_signature):
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
+
+    # Parse webhook payload
+    try:
+        payload = json.loads(body_text) if body_text else {}
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    event = payload.get("event", "")
+    data = payload.get("data", {})
+
+    # Only process successful transfer/charge events
+    if event not in ("transfer.success", "charge.success", "dedicated_account.assigned"):
+        return {"status": "ignored", "event": event}
+
+    # Match by account number
+    account_number = data.get("account_number") or data.get("dedicated_account", {}).get("account_number")
+    if not account_number:
+        return {"status": "ignored", "reason": "no account number in payload"}
+
+    va = db.query(VirtualAccount).filter(
+        VirtualAccount.account_number == str(account_number),
+    ).first()
+    if not va:
+        return {"status": "ignored", "reason": "account not found"}
+
+    if va.status != "active":
+        return {"status": "ignored", "reason": f"account status is {va.status}"}
+
+    # Check expiry
+    now = datetime.utcnow()
+    if va.expires_at and now > va.expires_at:
+        va.status = "expired"
+        db.commit()
+        return {"status": "ignored", "reason": "account expired"}
+
+    # Mark virtual account as paid
+    va.status = "paid"
+    va.updated_at = now
+
+    # Fund the escrow transaction (atomic conditional update to prevent double-funding)
+    tx = db.query(EscrowTransaction).filter(EscrowTransaction.id == va.escrow_tx_id).first()
+    if not tx:
+        return {"status": "error", "reason": "escrow transaction not found"}
+
+    if tx.status in ("payment_pending", "seller_accepted", "created"):
+        rows = db.query(EscrowTransaction).filter(
+            EscrowTransaction.id == tx.id,
+            EscrowTransaction.status.in_(["payment_pending", "seller_accepted", "created"]),
+        ).update({"status": "funded", "funded_at": now}, synchronize_session=False)
+        db.flush()
+        if rows != 1:
+            db.rollback()
+            return {"status": "error", "reason": "concurrent status change"}
+
+        # Record wallet transaction for audit trail (no balance deduction — external payment)
+        db.add(WalletTx(
+            user_id=tx.buyer_id,
+            amount=va.expected_amount,
+            type="escrow_fund_external",
+            description=f"Virtual account payment for {tx.listing_title} (Acct: {va.account_number})",
+        ))
+
+        # Audit log (no user context in webhook)
+        db.add(AuditLog(
+            actor_id=0,
+            action="virtual_account_payment",
+            target_type="escrow_transaction",
+            target_id=tx.id,
+            details=f"Virtual account {va.account_number} funded with ₦{va.expected_amount:,.0f}",
+        ))
+
+        db.commit()
+        db.refresh(tx)
+        notify_escrow_event(_tx_dict(tx), "escrow_funded")
+        return {"status": "success", "escrow_id": tx.id, "new_status": "funded"}
+
+    return {"status": "ignored", "reason": f"escrow status is {tx.status}"}

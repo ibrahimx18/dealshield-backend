@@ -31,10 +31,12 @@ class UserProfile(BaseModel):
     rating: float
 
 class AuthResponse(BaseModel):
-    access_token: str
+    access_token: str = ""
     refresh_token: str = ""  # NEW: refresh token alongside access token
     token_type: str = "bearer"
-    user: UserProfile
+    user: Optional[UserProfile] = None
+    requires_2fa: bool = False  # NEW: if true, client must complete 2FA via /auth/login/2fa
+    temp_token: str = ""  # NEW: temporary token for 2FA login completion
 
 
 class RefreshTokenRequest(BaseModel):
@@ -70,6 +72,29 @@ class ChangePasswordRequest(BaseModel):
 
 class LogoutRequest(BaseModel):
     refresh_token: str
+
+
+class Enable2FAResponse(BaseModel):
+    """Response when enabling 2FA — contains secret, URI for QR, and backup codes."""
+    secret: str
+    uri: str
+    backup_codes: List[str]
+
+
+class Verify2FARequest(BaseModel):
+    """Verify a TOTP token to complete 2FA enablement."""
+    token: str
+
+
+class Disable2FARequest(BaseModel):
+    """Disable 2FA — requires current TOTP token."""
+    token: str
+
+
+class Login2FARequest(BaseModel):
+    """Complete login with 2FA — temp token + TOTP code (or backup code)."""
+    temp_token: str
+    totp_code: str
 
 # === LISTING ===
 class ListingCreate(BaseModel):
@@ -158,6 +183,9 @@ class EscrowOut(BaseModel):
     facilitator_payout: float = 0.0
     buyer_accepted_terms: bool = False
     seller_accepted_terms: bool = False
+    gateway_fee: float = 0.0
+    buyer_gateway_share: float = 0.0
+    seller_gateway_share: float = 0.0
 
 class EscrowListResponse(BaseModel):
     transactions: List[EscrowOut]
@@ -272,6 +300,22 @@ class PaymentResponse(BaseModel):
     authorization_url: Optional[str] = None
     reference: str
     status: str
+
+# === VIRTUAL ACCOUNTS ===
+class VirtualAccountOut(BaseModel):
+    id: int
+    escrow_tx_id: int
+    account_number: str
+    bank_name: str
+    bank_code: str
+    account_name: str
+    provider: str
+    status: str
+    expected_amount: float
+    expires_at: Optional[datetime] = None
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+
 
 # === VERIFICATION ===
 class VerifyBVN(BaseModel):

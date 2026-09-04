@@ -65,6 +65,8 @@ class User(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)  # NEW
     role = Column(String, default="user")  # user, merchant, admin
+    totp_secret = Column(String, nullable=True)  # TOTP shared secret for 2FA
+    totp_enabled = Column(Boolean, default=False)  # whether 2FA is enabled
 
     listings = relationship("Listing", backref="seller", foreign_keys="Listing.seller_id")
     reviews_given = relationship("Review", backref="reviewer", foreign_keys="Review.reviewer_id")
@@ -147,6 +149,10 @@ class EscrowTransaction(Base):
     buyer_accepted_at = Column(DateTime, nullable=True)
     seller_accepted_at = Column(DateTime, nullable=True)
     is_facilitated = Column(Boolean, default=False)
+    # ── Gateway fees (split 50/50 between buyer and seller) ──
+    gateway_fee = Column(Float, default=0.0)             # total payment gateway fee
+    buyer_gateway_share = Column(Float, default=0.0)     # buyer's portion (paid on funding)
+    seller_gateway_share = Column(Float, default=0.0)    # seller's portion (deducted on release)
 
 
 class WalletTx(Base):
@@ -281,3 +287,24 @@ class AuditLog(Base):
     ip_address = Column(String(45), nullable=True)
     details = Column(Text, default="")
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class VirtualAccount(Base):
+    """Dedicated virtual (NUBAN) account generated for each escrow transaction.
+    Buyers transfer directly to this account; a webhook confirms payment.
+    """
+    __tablename__ = "virtual_accounts"
+    id = Column(Integer, primary_key=True, index=True)
+    escrow_tx_id = Column(Integer, ForeignKey("escrow_transactions.id"), nullable=False, index=True)
+    account_number = Column(String(10), unique=True, nullable=False, index=True)
+    bank_name = Column(String, nullable=False, default="DealShield MFB")
+    bank_code = Column(String, nullable=False, default="999")
+    account_name = Column(String, nullable=False)
+    provider = Column(String, nullable=False, default="dealshield")
+    status = Column(String, nullable=False, default="active")  # active, expired, paid
+    expected_amount = Column(Float, nullable=False, default=0.0)
+    expires_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    escrow_tx = relationship("EscrowTransaction", backref="virtual_accounts")
