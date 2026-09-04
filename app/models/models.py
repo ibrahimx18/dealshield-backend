@@ -144,6 +144,7 @@ class EscrowTransaction(Base):
     facilitator_fee = Column(Float, default=0.0)           # total fee the facilitator charges buyer/seller for brokering
     dealshield_cut = Column(Float, default=0.0)            # 10% of facilitator fee — DealShield's share
     facilitator_payout = Column(Float, default=0.0)        # 90% of facilitator fee — what facilitator receives
+    cancellation_fee = Column(Float, default=0.0)          # ₦5,000 flat fee deducted on cancel/dispute, credited to DealShield
     buyer_accepted_terms = Column(Boolean, default=False)
     seller_accepted_terms = Column(Boolean, default=False)
     buyer_accepted_at = Column(DateTime, nullable=True)

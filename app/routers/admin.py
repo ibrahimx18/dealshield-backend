@@ -8,6 +8,7 @@ from pydantic import BaseModel
 from app.dependencies import get_db
 from app.models.models import EscrowTransaction, User, WalletTx, AdminAuditLog
 from app.routers.auth import get_current_user
+from app.routers.escrow import CANCELLATION_FEE
 from app.core.notifications import notify_escrow_event
 
 router = APIRouter()
@@ -198,12 +199,21 @@ def resolve_dispute(
 
     elif req.decision == "refund_to_buyer":
         buyer_refund = total_pool
+        # Deduct flat ₦5,000 cancellation fee, credit to DealShield
+        if buyer_refund > CANCELLATION_FEE:
+            buyer_refund -= CANCELLATION_FEE
+            tx.cancellation_fee = CANCELLATION_FEE
+            tx.dealshield_cut = (tx.dealshield_cut or 0) + CANCELLATION_FEE
+        else:
+            tx.cancellation_fee = buyer_refund
+            tx.dealshield_cut = (tx.dealshield_cut or 0) + buyer_refund
+            buyer_refund = 0.0
         buyer.wallet_balance += buyer_refund
         db.add(WalletTx(
             user_id=buyer.id, amount=buyer_refund, type="escrow_refund",
-            description=f"Admin dispute resolution refund for {tx.listing_title} (Tx #{tx.id})"
+            description=f"Admin dispute resolution refund for {tx.listing_title} (Tx #{tx.id}, ₦{tx.cancellation_fee:,.0f} cancellation fee deducted)"
         ))
-        details_str += f" Buyer refunded ₦{buyer_refund:,.2f}."
+        details_str += f" Buyer refunded ₦{buyer_refund:,.2f} (₦{tx.cancellation_fee:,.0f} cancellation fee deducted)."
 
     elif req.decision == "split":
         if req.buyer_split_percent is None or not (0 <= req.buyer_split_percent <= 100):
@@ -224,6 +234,16 @@ def resolve_dispute(
             buyer_share = round(deal_amount * buyer_pct, 2)
             # Seller gets their share of the deal amount
             seller_share = round(deal_amount * seller_pct, 2)
+
+            # Deduct ₦5,000 cancellation fee from buyer's share
+            if buyer_share > CANCELLATION_FEE:
+                buyer_share -= CANCELLATION_FEE
+                tx.cancellation_fee = CANCELLATION_FEE
+                tx.dealshield_cut = (tx.dealshield_cut or 0) + CANCELLATION_FEE
+            elif buyer_share > 0:
+                tx.cancellation_fee = buyer_share
+                tx.dealshield_cut = (tx.dealshield_cut or 0) + buyer_share
+                buyer_share = 0.0
 
             # Facilitator fee is reduced proportionally — facilitator gets
             # seller_pct of their fee (since seller is the one fulfilling)
@@ -259,6 +279,16 @@ def resolve_dispute(
             # Normal deal: split the total pool
             buyer_share = round(total_pool * buyer_pct, 2)
             seller_share = round(total_pool * seller_pct, 2)
+
+            # Deduct ₦5,000 cancellation fee from buyer's share
+            if buyer_share > CANCELLATION_FEE:
+                buyer_share -= CANCELLATION_FEE
+                tx.cancellation_fee = CANCELLATION_FEE
+                tx.dealshield_cut = (tx.dealshield_cut or 0) + CANCELLATION_FEE
+            elif buyer_share > 0:
+                tx.cancellation_fee = buyer_share
+                tx.dealshield_cut = (tx.dealshield_cut or 0) + buyer_share
+                buyer_share = 0.0
 
             if buyer_share > 0:
                 buyer.wallet_balance += buyer_share

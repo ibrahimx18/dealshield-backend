@@ -36,6 +36,10 @@ INSURANCE_RATE = 0.015
 GATEWAY_FEE_RATE = 0.015
 GATEWAY_FEE_CAP = 50000.0
 
+# Cancellation/Dispute flat fee — DealShield charges ₦5,000 when a funded deal
+# is cancelled or a dispute results in refund/split. Deducted from buyer's refund.
+CANCELLATION_FEE = 5000.0
+
 # Deadline constants
 ACCEPT_DEADLINE_HOURS = 48       # Seller must accept within 48h
 PAYMENT_DEADLINE_HOURS = 24      # Buyer must fund within 24h after seller accepts
@@ -85,6 +89,7 @@ def _tx_dict(tx: EscrowTransaction) -> dict:
         "facilitator_fee": tx.facilitator_fee or 0.0,
         "dealshield_cut": tx.dealshield_cut or 0.0,
         "facilitator_payout": tx.facilitator_payout or 0.0,
+        "cancellation_fee": tx.cancellation_fee or 0.0,
         "gateway_fee": tx.gateway_fee or 0.0,
         "buyer_gateway_share": tx.buyer_gateway_share or 0.0,
         "seller_gateway_share": tx.seller_gateway_share or 0.0,
@@ -173,9 +178,12 @@ def _release_funds(db: Session, tx: EscrowTransaction):
 
 
 def _refund_buyer(db: Session, tx: EscrowTransaction, partial_amount: float | None = None):
-    """Refund buyer (full or partial).
-    Facilitated deal: refund = deal_amount + facilitator_fee + insurance + buyer_gateway_share.
-    Normal deal: refund = amount + insurance + buyer_gateway_share.
+    """Refund buyer (full or partial), minus ₦5,000 cancellation fee for funded deals.
+
+    Facilitated deal: refund = deal_amount + facilitator_fee + insurance + buyer_gateway_share - cancellation_fee.
+    Normal deal: refund = amount + insurance + buyer_gateway_share - cancellation_fee.
+
+    The ₦5,000 cancellation_fee is credited to DealShield's revenue and recorded on the tx.
     """
     buyer = db.query(User).filter(User.id == tx.buyer_id).first()
     if partial_amount is not None:
@@ -184,10 +192,22 @@ def _refund_buyer(db: Session, tx: EscrowTransaction, partial_amount: float | No
         refund = tx.amount + tx.facilitator_fee + (tx.insurance_fee or 0) + (tx.buyer_gateway_share or 0)
     else:
         refund = tx.amount + (tx.insurance_fee or 0) + (tx.buyer_gateway_share or 0)
+
+    # Deduct flat cancellation fee from buyer's refund, credit to DealShield
+    if refund > CANCELLATION_FEE:
+        refund -= CANCELLATION_FEE
+        tx.cancellation_fee = CANCELLATION_FEE
+        tx.dealshield_cut = (tx.dealshield_cut or 0) + CANCELLATION_FEE
+    else:
+        # If refund is less than the fee, take what's available
+        tx.cancellation_fee = refund
+        tx.dealshield_cut = (tx.dealshield_cut or 0) + refund
+        refund = 0.0
+
     buyer.wallet_balance += refund
     db.add(WalletTx(
         user_id=buyer.id, amount=refund, type="escrow_refund",
-        description=f"Escrow refund for {tx.listing_title}"
+        description=f"Escrow refund for {tx.listing_title} (₦{tx.cancellation_fee:,.0f} cancellation fee deducted)"
     ))
 
 
