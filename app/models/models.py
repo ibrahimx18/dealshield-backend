@@ -96,7 +96,7 @@ class Listing(Base):
 class EscrowTransaction(Base):
     __tablename__ = "escrow_transactions"
     id = Column(Integer, primary_key=True, index=True)
-    listing_id = Column(Integer, ForeignKey("listings.id"), nullable=False)
+    listing_id = Column(Integer, ForeignKey("listings.id"), nullable=True)  # nullable for facilitated deals
     listing_title = Column(String, nullable=False)
     category = Column(String, nullable=False)
     amount = Column(Float, nullable=False)
@@ -154,6 +154,11 @@ class EscrowTransaction(Base):
     gateway_fee = Column(Float, default=0.0)             # total payment gateway fee
     buyer_gateway_share = Column(Float, default=0.0)     # buyer's portion (paid on funding)
     seller_gateway_share = Column(Float, default=0.0)    # seller's portion (deducted on release)
+    # ── Release OTP (buyer enters code to release funds) ──
+    release_otp = Column(String, default="")              # 6-digit OTP generated when buyer_review starts
+    release_otp_expiry = Column(DateTime, nullable=True)  # OTP validity window
+    # ── Shareable deal link ──
+    share_token = Column(String, default="")              # unique token for shareable deal link
 
 
 class WalletTx(Base):

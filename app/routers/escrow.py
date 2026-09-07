@@ -14,13 +14,29 @@ import json
 import random
 import hashlib
 import hmac
+import secrets
 from fastapi import APIRouter, Depends, HTTPException, Request, Header
 from sqlalchemy.orm import Session
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
+
+def _utcnow():
+    """Return timezone-naive UTC datetime to match PostgreSQL columns."""
+    return datetime.utcnow()
+
+
+def _strip_tz(dt):
+    """Strip timezone info from a datetime for safe comparison."""
+    if dt is None:
+        return None
+    if hasattr(dt, 'tzinfo') and dt.tzinfo is not None:
+        return dt.replace(tzinfo=None)
+    return dt
 from app.dependencies import get_db
 from app.schemas.schemas import (
     EscrowCreate, EscrowShip, EscrowOut, EscrowListResponse, EscrowDispute,
     EscrowFulfill, FacilitatedDealCreate, FacilitatorAcceptTerms, VirtualAccountOut,
+    ReleaseOTPRequest,
 )
 from app.models.models import EscrowTransaction, User, Listing, WalletTx, AuditLog, VirtualAccount
 from app.routers.auth import get_current_user, _update_badge
@@ -43,7 +59,7 @@ CANCELLATION_FEE = 5000.0
 # Deadline constants
 ACCEPT_DEADLINE_HOURS = 48       # Seller must accept within 48h
 PAYMENT_DEADLINE_HOURS = 24      # Buyer must fund within 24h after seller accepts
-BUYER_REVIEW_DAYS = 7            # Auto-release after 7 days if buyer is silent
+BUYER_REVIEW_DAYS = 1             # Auto-release after 24 hours if buyer is silent
 
 
 def _calc_gateway_fee(amount: float) -> float:
@@ -98,6 +114,9 @@ def _tx_dict(tx: EscrowTransaction) -> dict:
         "gateway_fee": tx.gateway_fee or 0.0,
         "buyer_gateway_share": tx.buyer_gateway_share or 0.0,
         "seller_gateway_share": tx.seller_gateway_share or 0.0,
+        "release_otp": tx.release_otp or "",
+        "release_otp_expiry": tx.release_otp_expiry.isoformat() if tx.release_otp_expiry else None,
+        "share_token": tx.share_token or "",
     }
 
 
@@ -276,7 +295,7 @@ def seller_accept(tx_id: int, request: Request,
         raise HTTPException(status_code=400, detail=f"Cannot accept — current status: {tx.status}")
 
     now = datetime.utcnow()
-    if tx.accept_deadline and now > tx.accept_deadline:
+    if tx.accept_deadline and now > _strip_tz(tx.accept_deadline):
         tx.status = "expired"
         tx.closed_at = now
         db.commit()
@@ -333,7 +352,7 @@ def fund_escrow(tx_id: int, request: Request,
         raise HTTPException(status_code=400, detail=f"Cannot fund — current status: {tx.status}")
 
     now = datetime.utcnow()
-    if tx.payment_deadline and now > tx.payment_deadline:
+    if tx.payment_deadline and now > _strip_tz(tx.payment_deadline):
         tx.status = "expired"
         tx.closed_at = now
         db.commit()
@@ -435,6 +454,10 @@ def mark_delivered(tx_id: int, request: Request,
     tx.buyer_review_started_at = now
     tx.buyer_review_deadline = now + timedelta(days=BUYER_REVIEW_DAYS)
 
+    # Generate 6-digit release OTP for buyer
+    tx.release_otp = f"{random.randint(100000, 999999)}"
+    tx.release_otp_expiry = now + timedelta(hours=24)
+
     _log_audit(db, current_user.id, "escrow_delivered_to_buyer", request, target_id=tx.id)
     db.commit()
     db.refresh(tx)
@@ -481,6 +504,78 @@ def buyer_approve(tx_id: int, request: Request,
     db.refresh(tx)
     notify_escrow_event(_tx_dict(tx), "escrow_released")
     return _tx_dict(tx)
+
+
+# ── 7b. RELEASE WITH OTP — Buyer enters OTP to release funds ──
+
+@router.post("/{tx_id}/release-otp", response_model=EscrowOut)
+def release_with_otp(tx_id: int, otp_in: ReleaseOTPRequest, request: Request,
+                     current_user: User = Depends(get_current_user),
+                     db: Session = Depends(get_db)):
+    """Buyer submits the 6-digit OTP to release funds to seller.
+    Alternative to manual /approve — provides OTP-based verification.
+    """
+    tx = db.query(EscrowTransaction).filter(EscrowTransaction.id == tx_id).first()
+    if not tx:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    if tx.buyer_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Only the buyer can release with OTP")
+    if tx.status != "buyer_review":
+        raise HTTPException(status_code=400, detail=f"Cannot release — current status: {tx.status}")
+    if not tx.release_otp:
+        raise HTTPException(status_code=400, detail="No OTP generated for this transaction")
+    if tx.release_otp_expiry and datetime.utcnow() > _strip_tz(tx.release_otp_expiry):
+        raise HTTPException(status_code=400, detail="OTP has expired. Contact support or use manual approval.")
+
+    if otp_in.otp.strip() != tx.release_otp:
+        raise HTTPException(status_code=400, detail="Invalid OTP code")
+
+    now = datetime.utcnow()
+    # Clear OTP after use
+    tx.release_otp = ""
+    tx.release_otp_expiry = None
+
+    rows = db.query(EscrowTransaction).filter(
+        EscrowTransaction.id == tx_id,
+        EscrowTransaction.status == "buyer_review",
+    ).update({"status": "buyer_approved", "completed_at": now}, synchronize_session=False)
+    db.flush()
+    if rows != 1:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Transaction status changed concurrently")
+    db.refresh(tx)
+
+    _release_funds(db, tx)
+    tx.status = "released"
+    tx.closed_at = now
+
+    _log_audit(db, current_user.id, "escrow_otp_release", request, target_id=tx.id)
+    db.commit()
+    db.refresh(tx)
+    notify_escrow_event(_tx_dict(tx), "escrow_released")
+    return _tx_dict(tx)
+
+
+# ── 7c. GET RELEASE OTP — Buyer retrieves their OTP (for demo/testing) ──
+
+@router.get("/{tx_id}/release-otp")
+def get_release_otp(tx_id: int, current_user: User = Depends(get_current_user),
+                    db: Session = Depends(get_db)):
+    """Buyer retrieves their release OTP. In production, this would be sent via SMS/email.
+    For now, returns it directly (demo mode).
+    """
+    tx = db.query(EscrowTransaction).filter(EscrowTransaction.id == tx_id).first()
+    if not tx:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    if tx.buyer_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Only the buyer can view their OTP")
+    if tx.status != "buyer_review":
+        raise HTTPException(status_code=400, detail=f"OTP not available — current status: {tx.status}")
+    if not tx.release_otp:
+        raise HTTPException(status_code=400, detail="No OTP generated")
+    if tx.release_otp_expiry and datetime.utcnow() > _strip_tz(tx.release_otp_expiry):
+        raise HTTPException(status_code=400, detail="OTP has expired")
+    return {"otp": tx.release_otp, "expires_at": tx.release_otp_expiry.isoformat() if tx.release_otp_expiry else None}
 
 
 # ── 8. DISPUTE — Buyer or seller initiates a dispute ──
@@ -704,7 +799,7 @@ def facilitator_create_deal(deal_in: FacilitatedDealCreate, request: Request,
 
     now = datetime.utcnow()
     tx = EscrowTransaction(
-        listing_id=0,  # No listing for facilitated deals
+        listing_id=None,  # No listing for facilitated deals
         listing_title=sanitize_text(deal_in.title, max_length=200),
         category=deal_in.category,
         amount=deal_in.deal_amount,
@@ -721,6 +816,7 @@ def facilitator_create_deal(deal_in: FacilitatedDealCreate, request: Request,
         facilitator_name=current_user.name,
         facilitator_fee=deal_in.facilitator_fee,
         accept_deadline=now + timedelta(hours=ACCEPT_DEADLINE_HOURS),
+        share_token=secrets.token_urlsafe(16),
     )
     db.add(tx)
     db.flush()
@@ -856,6 +952,8 @@ def confirm_receipt_legacy(tx_id: int, request: Request,
         tx.status = "buyer_review"
         tx.buyer_review_started_at = now
         tx.buyer_review_deadline = now + timedelta(days=BUYER_REVIEW_DAYS)
+        tx.release_otp = f"{random.randint(100000, 999999)}"
+        tx.release_otp_expiry = now + timedelta(hours=24)
         db.flush()
     return buyer_approve(tx_id, request, current_user, db)
 
@@ -1093,3 +1191,36 @@ async def escrow_payment_webhook(request: Request,
         return {"status": "success", "escrow_id": tx.id, "new_status": "funded"}
 
     return {"status": "ignored", "reason": f"escrow status is {tx.status}"}
+
+
+# ── DEAL SHARE LINK — Get deal by share token (public, no auth) ──
+
+@router.get("/shared/{share_token}")
+def get_shared_deal(share_token: str, db: Session = Depends(get_db)):
+    """Public endpoint — anyone with the share token can view deal details.
+    Used by facilitators to share deal links with buyers/sellers.
+    Does NOT require authentication — only shows limited info.
+    """
+    tx = db.query(EscrowTransaction).filter(EscrowTransaction.share_token == share_token).first()
+    if not tx:
+        raise HTTPException(status_code=404, detail="Deal not found or link is invalid")
+    if not tx.is_facilitated:
+        raise HTTPException(status_code=404, detail="Deal not found")
+    # Return limited public info
+    return {
+        "id": tx.id,
+        "title": tx.listing_title,
+        "category": tx.category,
+        "deal_amount": tx.amount,
+        "facilitator_fee": tx.facilitator_fee,
+        "facilitator_name": tx.facilitator_name,
+        "status": tx.status,
+        "is_facilitated": True,
+        "buyer_name": tx.buyer_name,
+        "seller_name": tx.seller_name,
+        "gateway_fee": tx.gateway_fee,
+        "insurance_fee": tx.insurance_fee,
+        "accept_deadline": tx.accept_deadline.isoformat() if tx.accept_deadline else None,
+        "payment_deadline": tx.payment_deadline.isoformat() if tx.payment_deadline else None,
+        "created_at": tx.created_at.isoformat() if tx.created_at else None,
+    }

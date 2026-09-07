@@ -61,5 +61,5 @@ def create_listing(listing_in: ListingCreate, current_user: User = Depends(get_c
     db.add(listing)
     db.commit()
     db.refresh(listing)
-    notify_listing_event(_listing_dict(listing))
+    notify_listing_event(_listing_dict(listing), "listing_created")
     return _listing_dict(listing)

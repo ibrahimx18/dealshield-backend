@@ -186,6 +186,11 @@ class EscrowOut(BaseModel):
     gateway_fee: float = 0.0
     buyer_gateway_share: float = 0.0
     seller_gateway_share: float = 0.0
+    # Release OTP
+    release_otp: Optional[str] = None
+    release_otp_expiry: Optional[datetime] = None
+    # Shareable link
+    share_token: Optional[str] = None
 
 class EscrowListResponse(BaseModel):
     transactions: List[EscrowOut]
@@ -211,6 +216,11 @@ class FacilitatedDealCreate(BaseModel):
 class FacilitatorAcceptTerms(BaseModel):
     """Buyer or seller accepts the facilitator's deal terms."""
     role: str  # "buyer" or "seller"
+
+
+class ReleaseOTPRequest(BaseModel):
+    """Buyer submits OTP code to release funds."""
+    otp: str  # 6-digit code
 
 # === WALLET ===
 class WalletDeposit(BaseModel):
