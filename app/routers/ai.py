@@ -40,7 +40,7 @@ class FraudCheckResponse(BaseModel):
     recommendation: str
 
 
-FRAUD_PROMPT = """You are a fraud detection AI for SafePay, a Nigerian escrow platform.
+FRAUD_PROMPT = """You are a fraud detection AI for DealShield, a Nigerian escrow platform.
 Analyze this listing for potential fraud risk.
 
 Listing:

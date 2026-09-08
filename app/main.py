@@ -84,13 +84,13 @@ def seed():
     try:
         if db.query(User).first() is None:
             seller = User(
-                name="Ibrahim Seller", phone="08012345678", email="seller@safepay.ng",
+                name="Ibrahim Seller", phone="08012345678", email="seller@dealshield.ng",
                 hashed_password=get_password_hash("demo1234"),
                 wallet_balance=500000, nin_verified=True, phone_verified=True, id_verified=True,
                 total_deals=12, rating=4.8,
             )
             buyer = User(
-                name="Geralt Buyer", phone="08098765432", email="geralt@safepay.ng",
+                name="Geralt Buyer", phone="08098765432", email="geralt@dealshield.ng",
                 hashed_password=get_password_hash("demo1234"),
                 wallet_balance=500000, nin_verified=True, phone_verified=True, id_verified=True,
                 total_deals=3, rating=5.0,
@@ -124,7 +124,7 @@ def seed():
 
 seed()
 
-app = FastAPI(title="SafePay API", version="1.1.0")
+app = FastAPI(title="DealShield API", version="1.1.0")
 
 # Wire up rate limiter (moved from above — needs app to exist first)
 app.state.limiter = limiter

@@ -1,4 +1,4 @@
-"""Security middleware for SafePay backend.
+"""Security middleware for DealShield backend.
 Implements: security headers, HTTPS redirect, rate limiting, input sanitization.
 """
 import os

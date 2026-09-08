@@ -1,5 +1,5 @@
 """
-SafePay Admin/Integration API
+DealShield Admin/Integration API
 Endpoints for n8n workflows and external integrations.
 Protected by a shared secret key.
 """
