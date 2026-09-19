@@ -155,7 +155,7 @@ def register(user_in: UserCreate, request: Request, db: Session = Depends(get_db
         wallet_balance=500000.0 if SAFEPAY_TEST_MODE else 0.0,
         phone_verified=True,
         email_verified=False,
-        password_changed_at=datetime.utcnow(),
+        password_changed_at=datetime.now(timezone.utc),
     )
     db.add(user)
     db.commit()
@@ -434,7 +434,7 @@ def confirm_password_reset(payload: PasswordResetConfirm, request: Request, db: 
         raise HTTPException(status_code=400, detail=err_msg)
 
     user.hashed_password = get_password_hash(payload.new_password)
-    user.password_changed_at = datetime.utcnow()
+    user.password_changed_at = datetime.now(timezone.utc)
     reset.used = True
 
     # Revoke all existing sessions (force re-login everywhere)
@@ -465,7 +465,7 @@ def change_password(payload: ChangePasswordRequest, request: Request,
         raise HTTPException(status_code=400, detail="New password must be different from current password")
 
     current_user.hashed_password = get_password_hash(payload.new_password)
-    current_user.password_changed_at = datetime.utcnow()
+    current_user.password_changed_at = datetime.now(timezone.utc)
 
     # Revoke all refresh sessions (force re-login on every device)
     db.query(SessionModel).filter(
