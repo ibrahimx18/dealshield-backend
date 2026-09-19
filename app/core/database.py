@@ -6,7 +6,12 @@ from app.core.config import settings
 DATABASE_URL = settings.DATABASE_URL
 
 if DATABASE_URL.startswith("postgresql"):
-    engine = create_engine(DATABASE_URL, pool_size=10, max_overflow=20)
+    # Force every connection to UTC so timestamptz values round-trip as naive UTC,
+    # matching datetime.utcnow() used across the app regardless of server timezone.
+    engine = create_engine(
+        DATABASE_URL, pool_size=10, max_overflow=20,
+        connect_args={"options": "-c timezone=UTC"},
+    )
 elif DATABASE_URL.startswith("sqlite"):
     # SQLite — extract path from URL, create dirs if needed
     db_path = DATABASE_URL.replace("sqlite:///", "")
