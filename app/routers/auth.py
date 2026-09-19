@@ -1,6 +1,6 @@
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
@@ -53,6 +53,13 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
         raise HTTPException(status_code=401, detail="User not found")
     if not user.is_active:
         raise HTTPException(status_code=403, detail="Account suspended")
+    # Kill tokens issued before a password change (stolen-token containment)
+    # Compare at whole-second granularity: iat is truncated, pw timestamp has micros.
+    iat = payload.get("iat")
+    if iat and user.password_changed_at:
+        pw_ts = int(user.password_changed_at.replace(tzinfo=timezone.utc).timestamp())
+        if iat < pw_ts:
+            raise HTTPException(status_code=401, detail="Session expired due to password change. Please log in again.")
     return user
 
 
@@ -460,6 +467,11 @@ def change_password(payload: ChangePasswordRequest, request: Request,
     current_user.hashed_password = get_password_hash(payload.new_password)
     current_user.password_changed_at = datetime.utcnow()
 
+    # Revoke all refresh sessions (force re-login on every device)
+    db.query(SessionModel).filter(
+        SessionModel.user_id == current_user.id, SessionModel.revoked == False
+    ).update({"revoked": True})
+
     _log_audit(db, current_user.id, "password_change", request)
     db.commit()
 
@@ -595,10 +607,15 @@ def verify_2fa(payload: Verify2FARequest, request: Request, current_user: User =
     current_user.totp_secret = secret
     current_user.totp_enabled = True
 
+    # Security: revoke all other sessions — they predate 2FA and never proved the second factor
+    db.query(SessionModel).filter(
+        SessionModel.user_id == current_user.id, SessionModel.revoked == False
+    ).update({"revoked": True})
+
     _log_audit(db, current_user.id, "2fa_enabled", request)
     db.commit()
 
-    return {"detail": "2FA enabled successfully"}
+    return {"detail": "2FA enabled successfully. Other sessions have been logged out."}
 
 
 @router.post("/2fa/disable")
@@ -613,10 +630,15 @@ def disable_2fa(payload: Disable2FARequest, request: Request, current_user: User
     current_user.totp_enabled = False
     current_user.totp_secret = None
 
+    # Security: revoke all sessions after 2FA disable — treat as sensitive event
+    db.query(SessionModel).filter(
+        SessionModel.user_id == current_user.id, SessionModel.revoked == False
+    ).update({"revoked": True})
+
     _log_audit(db, current_user.id, "2fa_disabled", request)
     db.commit()
 
-    return {"detail": "2FA disabled successfully"}
+    return {"detail": "2FA disabled successfully. All sessions have been logged out."}
 
 
 @router.post("/login/2fa", response_model=AuthResponse)

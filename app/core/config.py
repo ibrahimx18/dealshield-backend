@@ -9,7 +9,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     SECRET_KEY: str = ""
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24  # 24 hours
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30  # short-lived: limits stolen-token window
     ALGORITHM: str = "HS256"
     DATABASE_URL: str = "sqlite:///./data/safepay.db"
     COMMISSION_RATE: float = 0.025
