@@ -1,5 +1,6 @@
 import hashlib
 import secrets
+import time
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
 from typing import Optional, Tuple
@@ -26,9 +27,9 @@ def get_password_hash(password: str) -> str:
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     to_encode = data.copy()
-    issued = datetime.utcnow()
-    expire = issued + (expires_delta or timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES))
-    to_encode.update({"exp": expire, "iat": int(issued.timestamp()), "type": TOKEN_TYPE_ACCESS})
+    issued_ts = int(time.time())
+    expire = datetime.utcfromtimestamp(issued_ts) + (expires_delta or timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES))
+    to_encode.update({"exp": expire, "iat": issued_ts, "type": TOKEN_TYPE_ACCESS})
     return jwt_encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
 
 
