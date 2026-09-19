@@ -247,6 +247,13 @@ def create_escrow(escrow_in: EscrowCreate, request: Request,
     if listing.seller_id == current_user.id:
         raise HTTPException(status_code=400, detail="Cannot buy your own listing")
 
+    # KYC gate: buyers must have completed identity verification before transacting
+    if not current_user.kyc_verified:
+        raise HTTPException(
+            status_code=403,
+            detail="Identity verification required before you can transact. Submit your NIN or BVN via /auth/kyc/submit.",
+        )
+
     insurance_fee = 0
     if escrow_in.insured:
         insurance_fee = round(listing.price * INSURANCE_RATE, 2)
@@ -774,6 +781,12 @@ def facilitator_create_deal(deal_in: FacilitatedDealCreate, request: Request,
     On release: seller gets full deal amount, facilitator gets 90% of their fee,
     DealShield keeps 10% of the facilitator's fee.
     """
+    # KYC gate: facilitators must be identity-verified before brokering deals
+    if not current_user.kyc_verified:
+        raise HTTPException(
+            status_code=403,
+            detail="Identity verification required before you can facilitate deals. Submit your NIN or BVN via /auth/kyc/submit.",
+        )
     # Validate facilitator fee
     if deal_in.facilitator_fee < 0:
         raise HTTPException(status_code=400, detail="Facilitator fee cannot be negative")

@@ -1,4 +1,5 @@
 import os
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -8,6 +9,7 @@ from app.dependencies import get_db
 from app.schemas.schemas import (
     UserCreate, UserLogin, AuthResponse, UserProfile,
     VerifyBVN, VerifyBusiness,
+    KYCSubmit, KYCStatus,
     RefreshTokenRequest, TokenResponse,
     EmailVerifyRequest,
     PasswordResetRequest, PasswordResetConfirm,
@@ -24,6 +26,7 @@ from app.core.security import (
     generate_backup_codes, create_2fa_temp_token, decode_2fa_temp_token,
 )
 from app.core.security_middleware import sanitize_text, validate_password_strength
+from app.core.kyc_crypto import encrypt_field, decrypt_field, mask_field, verify_id_number
 from app.models.models import User, Session as SessionModel, PasswordResetToken, AuditLog
 from app.core.notifications import notify_new_user, notify_kyc_submitted, notification_service
 
@@ -476,6 +479,69 @@ def change_password(payload: ChangePasswordRequest, request: Request,
     db.commit()
 
     return {"detail": "Password changed successfully"}
+
+
+# ── MANDATORY KYC: submit NIN or BVN (stored encrypted) ──
+
+@router.post("/kyc/submit", response_model=KYCStatus)
+def kyc_submit(payload: KYCSubmit, request: Request,
+               current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Submit NIN or BVN for identity verification.
+    The ID number is validated, then stored AES-256-GCM encrypted — plaintext
+    never touches the database, logs, or audit tables.
+    """
+    id_type = (payload.id_type or "").strip().lower()
+    if id_type not in ("nin", "bvn"):
+        raise HTTPException(status_code=400, detail="id_type must be 'nin' or 'bvn'")
+
+    id_number = (payload.id_number or "").strip()
+    if not verify_id_number(id_number, id_type):
+        raise HTTPException(status_code=400, detail=f"{id_type.upper()} must be exactly 11 digits")
+
+    phone = (payload.phone or "").strip()
+    if not re.match(r"^\+?\d{7,15}$", phone):
+        raise HTTPException(status_code=400, detail="A valid phone number is required")
+
+    encrypted = encrypt_field(id_number)
+
+    if id_type == "nin":
+        current_user.nin_encrypted = encrypted
+    else:
+        current_user.bvn_encrypted = encrypted
+
+    current_user.kyc_id_type = id_type
+    current_user.kyc_phone_provided = phone
+    current_user.kyc_verified = True
+    current_user.kyc_submitted_at = datetime.now(timezone.utc)
+    if id_type == "nin":
+        current_user.nin_verified = True
+        current_user.id_verified = True
+    else:
+        current_user.bvn_verified = True
+    _update_badge(current_user)
+
+    _log_audit(db, current_user.id, "kyc_submitted", request)  # no ID number in details
+    db.commit()
+
+    return {
+        "kyc_verified": True,
+        "id_type": id_type,
+        "id_masked": mask_field(encrypted),
+        "phone_provided": phone,
+        "submitted_at": current_user.kyc_submitted_at,
+    }
+
+
+@router.get("/kyc/status", response_model=KYCStatus)
+def kyc_status(current_user: User = Depends(get_current_user)):
+    enc = current_user.nin_encrypted or current_user.bvn_encrypted or ""
+    return {
+        "kyc_verified": current_user.kyc_verified,
+        "id_type": current_user.kyc_id_type,
+        "id_masked": mask_field(enc) if enc else None,
+        "phone_provided": current_user.kyc_phone_provided,
+        "submitted_at": current_user.kyc_submitted_at,
+    }
 
 
 # ── PHONE / NIN / BVN / BUSINESS VERIFICATION (existing) ──

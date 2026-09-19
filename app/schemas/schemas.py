@@ -331,6 +331,21 @@ class VirtualAccountOut(BaseModel):
 class VerifyBVN(BaseModel):
     bvn: str
 
+
+class KYCSubmit(BaseModel):
+    """Mandatory KYC submission: NIN or BVN + real phone number."""
+    id_type: str          # "nin" | "bvn"
+    id_number: str        # 11 digits — stored encrypted, never plaintext
+    phone: str            # real phone number for identity linkage
+
+
+class KYCStatus(BaseModel):
+    kyc_verified: bool
+    id_type: str | None = None
+    id_masked: str | None = None
+    phone_provided: str | None = None
+    submitted_at: datetime | None = None
+
 class VerifyBusiness(BaseModel):
     business_name: str
     rc_number: str

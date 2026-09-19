@@ -49,6 +49,12 @@ class User(Base):
     hashed_password = Column(String, nullable=False)
     wallet_balance = Column(Float, default=0.0)
     nin_verified = Column(Boolean, default=False)
+    nin_encrypted = Column(Text, nullable=True)   # AES-256-GCM ciphertext, never plaintext
+    bvn_encrypted = Column(Text, nullable=True)   # AES-256-GCM ciphertext, never plaintext
+    kyc_verified = Column(Boolean, default=False, nullable=False)
+    kyc_submitted_at = Column(DateTime, nullable=True)
+    kyc_id_type = Column(String, nullable=True)  # "nin" | "bvn"
+    kyc_phone_provided = Column(String, nullable=True)
     phone_verified = Column(Boolean, default=True)
     email_verified = Column(Boolean, default=False, nullable=False)  # NEW: email verification flag
     id_verified = Column(Boolean, default=False)

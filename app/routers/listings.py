@@ -46,6 +46,12 @@ def get_listing(listing_id: int, db: Session = Depends(get_db)):
 
 @router.post("", response_model=ListingOut)
 def create_listing(listing_in: ListingCreate, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    # KYC gate: sellers must have completed identity verification before listing
+    if not current_user.kyc_verified:
+        raise HTTPException(
+            status_code=403,
+            detail="Identity verification required before you can create listings. Submit your NIN or BVN via /auth/kyc/submit.",
+        )
     listing = Listing(
         category=listing_in.category,
         title=sanitize_text(listing_in.title, max_length=200),
