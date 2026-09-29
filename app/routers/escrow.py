@@ -1033,6 +1033,36 @@ def get_virtual_account(tx_id: int,
     return _va_dict(va)  # read-only: no expiry writes on GET
 
 
+@router.post("/{tx_id}/payment-intent")
+def create_payment_intent(tx_id: int, request: Request,
+                          current_user: User = Depends(get_current_user),
+                          db: Session = Depends(get_db)):
+    """B04: create a provider reference bound to this escrow with the exact
+    server-computed amount. The webhook only funds an escrow via such an intent.
+    Returns 503 when the provider is not configured."""
+    if not settings.PAYSTACK_SECRET_KEY:
+        raise HTTPException(status_code=503, detail="External payment is unavailable: provider not configured")
+    tx = db.query(EscrowTransaction).filter(EscrowTransaction.id == tx_id).first()
+    if not tx:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    if tx.buyer_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Only the buyer can pay")
+    if tx.status not in FUNDABLE_STATES:
+        raise HTTPException(status_code=400, detail=f"Cannot pay - current status: {tx.status}")
+    if tx.is_facilitated and not (tx.buyer_accepted_terms and tx.seller_accepted_terms):
+        raise HTTPException(status_code=400, detail="Both parties must accept the facilitated deal terms before funding")
+    quote = _funding_quote(tx)
+    reference = f"DSX_{tx.id}_{secrets.token_urlsafe(12)}"
+    db.add(PaymentReference(reference=reference, user_id=current_user.id, amount=quote["total_with_gateway"],
+                            provider=WEBHOOK_PROVIDER, status="pending", escrow_tx_id=tx.id, currency="NGN"))
+    _log_audit(db, current_user.id, "escrow_payment_intent", request, target_id=tx.id,
+               details=f"ref {reference}, NGN {quote['total_with_gateway']}")
+    db.commit()
+    return {"reference": reference, "amount": money_out(quote["total_with_gateway"]),
+            "amount_kobo": int(quote["total_with_gateway"] * 100), "currency": "NGN",
+            "provider": WEBHOOK_PROVIDER}
+
+
 # B04: only this event type means "money was received". transfer.success is an
 # OUTGOING payout and dedicated_account.assigned is account provisioning.
 FUNDING_EVENT_TYPES = {"charge.success"}
