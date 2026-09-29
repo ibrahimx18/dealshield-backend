@@ -34,7 +34,13 @@ def get_password_hash(password: str) -> str:
 
 # ── Access Token (short-lived JWT) ──
 
+REQUIRED_SESSION_CLAIMS = ["exp", "iat", "sub", "sid", "type"]
+
+
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+    """Access JWT. `data` must contain sub and sid (server-side session id, B05)."""
+    if not data.get("sub") or not data.get("sid"):
+        raise ValueError("access tokens must be bound to a session (sub + sid)")
     to_encode = data.copy()
     issued_ts = int(time.time())
     expire = datetime.utcfromtimestamp(issued_ts) + (expires_delta or timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES))
@@ -42,38 +48,46 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     return jwt_encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
 
 
-def decode_access_token(token: str) -> Optional[dict]:
-    """Decode and validate an access token. Returns payload or None."""
+def _decode_session_token(token: str, token_type: str) -> Optional[dict]:
     try:
-        payload = jwt_decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-        if payload.get("type") != TOKEN_TYPE_ACCESS:
-            return None
-        return payload
+        payload = jwt_decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM],
+                             options={"require": REQUIRED_SESSION_CLAIMS})
     except JWTError:
         return None
+    if payload.get("type") != token_type:
+        return None
+    sub, sid = payload.get("sub"), payload.get("sid")
+    if not isinstance(sub, str) or not sub.isdigit() or len(sub) > 18 or int(sub) <= 0:
+        return None
+    if not isinstance(sid, str) or not 16 <= len(sid) <= 64:
+        return None
+    return payload
+
+
+def decode_access_token(token: str) -> Optional[dict]:
+    """Rejects legacy tokens without sid/iat. Callers must ALSO check the session row."""
+    return _decode_session_token(token, TOKEN_TYPE_ACCESS)
 
 
 # ── Refresh Token (longer-lived JWT) ──
 
 def create_refresh_token(data: dict) -> str:
-    """Create a longer-lived refresh token (30 days).
-    Includes a random JTI to ensure uniqueness even if generated in the same second.
-    """
+    """Refresh JWT (30 days), bound to the same sid; random jti makes each rotation unique."""
+    if not data.get("sub") or not data.get("sid"):
+        raise ValueError("refresh tokens must be bound to a session (sub + sid)")
     to_encode = data.copy()
     expire = datetime.utcnow() + timedelta(days=30)
-    to_encode.update({"exp": expire, "type": TOKEN_TYPE_REFRESH, "jti": secrets.token_hex(16)})
+    to_encode.update({"exp": expire, "iat": int(time.time()), "type": TOKEN_TYPE_REFRESH,
+                      "jti": secrets.token_hex(16)})
     return jwt_encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
 
 
 def decode_refresh_token(token: str) -> Optional[dict]:
-    """Decode and validate a refresh token. Returns payload or None."""
-    try:
-        payload = jwt_decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-        if payload.get("type") != TOKEN_TYPE_REFRESH:
-            return None
-        return payload
-    except JWTError:
-        return None
+    return _decode_session_token(token, TOKEN_TYPE_REFRESH)
+
+
+def new_session_id() -> str:
+    return secrets.token_urlsafe(24)
 
 
 # ── Email Verification Token (short-lived JWT) ──
@@ -144,19 +158,28 @@ def generate_backup_codes(count: int = 10) -> list[str]:
     return [secrets.token_hex(4).upper() for _ in range(count)]
 
 
-def create_2fa_temp_token(user_id: int) -> str:
-    """Create a short-lived temporary JWT for the 2FA login flow (5 minutes)."""
+def credential_version(hashed_password: str, totp_secret: Optional[str]) -> str:
+    """Changes whenever the password or 2FA secret changes (B12)."""
+    return hash_token(f"{hashed_password}|{(totp_secret or '').split('|')[0]}")
+
+
+def create_2fa_temp_token(user_id: int, cred_version: str) -> str:
+    """Short-lived (5 min) 2FA challenge, bound to the current credential version."""
     expire = datetime.utcnow() + timedelta(minutes=5)
-    to_encode = {"sub": str(user_id), "exp": expire, "type": TOKEN_TYPE_2FA_TEMP}
+    to_encode = {"sub": str(user_id), "exp": expire, "iat": int(time.time()), "type": TOKEN_TYPE_2FA_TEMP,
+                 "cv": cred_version}
     return jwt_encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
 
 
 def decode_2fa_temp_token(token: str) -> Optional[dict]:
-    """Decode and validate a 2FA temp token. Returns payload or None."""
     try:
-        payload = jwt_decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-        if payload.get("type") != TOKEN_TYPE_2FA_TEMP:
-            return None
-        return payload
+        payload = jwt_decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM],
+                             options={"require": ["exp", "sub", "cv", "type"]})
     except JWTError:
         return None
+    if payload.get("type") != TOKEN_TYPE_2FA_TEMP:
+        return None
+    sub = payload.get("sub")
+    if not isinstance(sub, str) or not sub.isdigit():
+        return None
+    return payload

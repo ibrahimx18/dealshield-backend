@@ -353,3 +353,35 @@ def get_admin_audit_logs(
     """Retrieve recent admin audit logs for compliance & transparency."""
     logs = db.query(AdminAuditLog).order_by(AdminAuditLog.created_at.desc()).limit(limit).all()
     return logs
+
+
+class KYCDecision(BaseModel):
+    decision: Literal["verified", "rejected"]
+    reason: str
+
+
+@router.post("/kyc/{user_id}/decision", response_model=dict)
+def kyc_decision(user_id: int, req: KYCDecision, db: Session = Depends(get_db),
+                 admin: User = Depends(require_admin)):
+    """B02: the ONLY path to kyc_status='verified' - a human reviewer (or, later, a
+    provider callback) after checking the submitted identity out of band."""
+    from app.core.kyc_provider import KYC_PENDING
+    if not req.reason or len(req.reason.strip()) < 5:
+        raise HTTPException(status_code=400, detail="A review reason (at least 5 characters) is required.")
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if user.kyc_status != KYC_PENDING:
+        raise HTTPException(status_code=400, detail=f"KYC is '{user.kyc_status}', not pending_verification")
+    verified = req.decision == "verified"
+    user.kyc_status = req.decision
+    user.kyc_verified = verified
+    if user.kyc_id_type == "nin":
+        user.nin_verified = verified
+        user.id_verified = verified
+    elif user.kyc_id_type == "bvn":
+        user.bvn_verified = verified
+    db.add(AdminAuditLog(admin_id=admin.id, action=f"kyc_{req.decision}", target_type="user",
+                         target_id=user.id, details=sanitize_text(req.reason, max_length=500)))
+    db.commit()
+    return {"user_id": user.id, "kyc_status": user.kyc_status, "kyc_verified": user.kyc_verified}

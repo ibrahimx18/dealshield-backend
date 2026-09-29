@@ -37,7 +37,7 @@ class NotificationService:
         """Send an email notification. Logs if SMTP not configured."""
         if not self.smtp_host:
             logger.info(f"[EMAIL] (no SMTP configured) To: {to_email}, Subject: {subject}")
-            logger.info(f"[EMAIL] Body: {body[:200]}")
+            # B13: never log message bodies (they can contain reset/verification tokens)
             return False
 
         try:
@@ -62,7 +62,7 @@ class NotificationService:
     def send_sms(self, phone: str, message: str):
         """Send an SMS notification. Logs if SMS provider not configured."""
         if not self._sms_configured():
-            logger.info(f"[SMS] (no provider configured) To: {phone}, Message: {message[:200]}")
+            logger.info(f"[SMS] (no provider configured) To: ***{str(phone)[-4:]}, message withheld ({len(message)} chars)")
             return False
 
         try:

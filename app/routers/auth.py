@@ -4,6 +4,9 @@ import time
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.security import OAuth2PasswordBearer
+import hmac
+from sqlalchemy import update as sa_update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from app.dependencies import get_db
 from app.schemas.schemas import (
@@ -24,9 +27,11 @@ from app.core.security import (
     hash_token, generate_password_reset_token,
     generate_totp_secret, generate_totp_uri, verify_totp,
     generate_backup_codes, create_2fa_temp_token, decode_2fa_temp_token,
+    new_session_id, credential_version,
 )
 from app.core.security_middleware import sanitize_text, validate_password_strength
 from app.core.kyc_crypto import encrypt_field, decrypt_field, mask_field, verify_id_number
+from app.core.kyc_provider import get_kyc_provider, KYC_PENDING, KYC_VERIFIED, KYC_NONE
 from app.models.models import User, Session as SessionModel, PasswordResetToken, AuditLog
 from app.core.notifications import notify_new_user, notify_kyc_submitted, notification_service
 from decimal import Decimal
@@ -34,6 +39,7 @@ from app.core.money import money_out
 
 router = APIRouter()
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+optional_oauth2 = OAuth2PasswordBearer(tokenUrl="/auth/login", auto_error=False)
 
 # Test mode — welcome bonus wallet balance (demo only)
 SAFEPAY_TEST_MODE = os.getenv("SAFEPAY_TEST_MODE", "false").strip().lower() in ("1", "true", "yes")
@@ -46,26 +52,49 @@ PASSWORD_RESET_EXPIRE_HOURS = 1
 MAX_ACTIVE_SESSIONS = 5
 
 
-def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
+def _live_session(db: Session, claims: dict) -> SessionModel | None:
+    """B05: the server-side session named by the token's sid must exist, belong to
+    the subject, be unrevoked and unexpired. Checked on EVERY authenticated request."""
+    return db.query(SessionModel).filter(
+        SessionModel.sid == claims["sid"],
+        SessionModel.user_id == int(claims["sub"]),
+        SessionModel.revoked == False,
+        SessionModel.expires_at > datetime.utcnow(),
+    ).first()
+
+
+def get_current_session(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> SessionModel:
     payload = decode_access_token(token)
     if payload is None:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
-    user_id = payload.get("sub")
-    if user_id is None:
-        raise HTTPException(status_code=401, detail="Invalid token")
-    user = db.query(User).filter(User.id == int(user_id)).first()
+        raise HTTPException(status_code=401, detail="Invalid, expired or legacy token. Please log in again.")
+    session = _live_session(db, payload)
+    if session is None:
+        raise HTTPException(status_code=401, detail="Session expired or revoked. Please log in again.")
+    return session
+
+
+def get_current_user(session: SessionModel = Depends(get_current_session), db: Session = Depends(get_db)) -> User:
+    user = db.query(User).filter(User.id == session.user_id).first()
     if user is None:
         raise HTTPException(status_code=401, detail="User not found")
     if not user.is_active:
         raise HTTPException(status_code=403, detail="Account suspended")
-    # Kill tokens issued before a password change (stolen-token containment)
-    # Compare at whole-second granularity: iat is truncated, pw timestamp has micros.
-    iat = payload.get("iat")
-    if iat and user.password_changed_at:
-        pw_ts = int(user.password_changed_at.replace(tzinfo=timezone.utc).timestamp())
-        if iat < pw_ts:
-            raise HTTPException(status_code=401, detail="Session expired due to password change. Please log in again.")
     return user
+
+
+def _revoke_sessions(db: Session, user_id: int, except_sid: str | None = None):
+    q = db.query(SessionModel).filter(SessionModel.user_id == user_id, SessionModel.revoked == False)
+    if except_sid:
+        q = q.filter(SessionModel.sid != except_sid)
+    q.update({"revoked": True, "revoked_at": datetime.utcnow()}, synchronize_session=False)
+
+
+def _revoke_user_credentials(db: Session, user_id: int):
+    """Password change/reset: kill every session and every outstanding reset token."""
+    _revoke_sessions(db, user_id)
+    db.query(PasswordResetToken).filter(
+        PasswordResetToken.user_id == user_id, PasswordResetToken.used == False,
+    ).update({"used": True}, synchronize_session=False)
 
 
 def _profile_dict(user: User) -> dict:
@@ -78,6 +107,8 @@ def _profile_dict(user: User) -> dict:
         "nin_verified": user.nin_verified,
         "phone_verified": user.phone_verified,
         "email_verified": user.email_verified,
+        "totp_enabled": bool(user.totp_enabled),
+        "kyc_status": user.kyc_status or KYC_NONE,
         "id_verified": user.id_verified,
         "bvn_verified": user.bvn_verified,
         "business_verified": user.business_verified,
@@ -114,28 +145,33 @@ def _log_audit(db: Session, actor_id: int, action: str, request: Request,
     db.add(log)
 
 
-def _create_session_record(db: Session, user_id: int, refresh_token: str,
-                           request: Request) -> None:
-    """Store the hashed refresh token in the sessions table."""
-    # Enforce max active sessions — revoke oldest if over limit
-    active_sessions = (
-        db.query(SessionModel)
-        .filter(SessionModel.user_id == user_id, SessionModel.revoked == False)
-        .order_by(SessionModel.created_at.asc())
+def _create_session_record(db: Session, user_id: int, request: Request) -> tuple[str, str]:
+    """Create a server-side session and return (access_token, refresh_token) bound to it."""
+    now = datetime.utcnow()
+    active = (
+        db.query(SessionModel.id)
+        .filter(SessionModel.user_id == user_id, SessionModel.revoked == False, SessionModel.expires_at > now)
+        .order_by(SessionModel.created_at.asc(), SessionModel.id.asc())
         .all()
     )
-    if len(active_sessions) >= MAX_ACTIVE_SESSIONS:
-        for s in active_sessions[:len(active_sessions) - MAX_ACTIVE_SESSIONS + 1]:
-            s.revoked = True
+    if len(active) >= MAX_ACTIVE_SESSIONS:
+        oldest = [row[0] for row in active[:len(active) - MAX_ACTIVE_SESSIONS + 1]]
+        db.query(SessionModel).filter(SessionModel.id.in_(oldest)).update(
+            {"revoked": True, "revoked_at": now}, synchronize_session=False)
 
-    session = SessionModel(
+    sid = new_session_id()
+    claims = {"sub": str(user_id), "sid": sid}
+    access_token = create_access_token(claims)
+    refresh_token = create_refresh_token(claims)
+    db.add(SessionModel(
         user_id=user_id,
+        sid=sid,
         token_hash=hash_token(refresh_token),
         ip_address=request.client.host if request.client else None,
         user_agent=request.headers.get("user-agent", "")[:500],
-        expires_at=datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS),
-    )
-    db.add(session)
+        expires_at=now + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS),
+    ))
+    return access_token, refresh_token
 
 
 # ── REGISTER ──
@@ -148,30 +184,31 @@ def register(user_in: UserCreate, request: Request, db: Session = Depends(get_db
 
     safe_name = sanitize_text(user_in.name, max_length=100)
 
-    existing = db.query(User).filter((User.email == user_in.email) | (User.phone == user_in.phone)).first()
+    normalized_email = user_in.email.lower().strip()
+    existing = db.query(User).filter((User.email == normalized_email) | (User.phone == user_in.phone)).first()
     if existing:
         raise HTTPException(status_code=400, detail="Email or phone already registered")
 
     user = User(
         name=safe_name,
         phone=user_in.phone,
-        email=user_in.email.lower().strip(),
+        email=normalized_email,
         hashed_password=get_password_hash(user_in.password),
         wallet_balance=Decimal("500000.00") if SAFEPAY_TEST_MODE else Decimal("0.00"),
-        phone_verified=True,
+        phone_verified=False,  # B02: never assumed; needs an OTP provider
         email_verified=False,
-        password_changed_at=datetime.now(timezone.utc),
+        kyc_status=KYC_NONE,
+        password_changed_at=datetime.utcnow(),
     )
     db.add(user)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="Email or phone already registered")
     db.refresh(user)
 
-    # Generate tokens
-    access_token = create_access_token(data={"sub": str(user.id)})
-    refresh_token = create_refresh_token(data={"sub": str(user.id)})
-
-    # Store session
-    _create_session_record(db, user.id, refresh_token, request)
+    access_token, refresh_token = _create_session_record(db, user.id, request)
     _log_audit(db, user.id, "register", request)
     db.commit()
 
@@ -235,7 +272,7 @@ def login(data: UserLogin, request: Request, db: Session = Depends(get_db)):
 
     # ── 2FA check: if enabled, return temp token instead of full access ──
     if user.totp_enabled and user.totp_secret:
-        temp_token = create_2fa_temp_token(user.id)
+        temp_token = create_2fa_temp_token(user.id, credential_version(user.hashed_password, user.totp_secret))
         _log_audit(db, user.id, "login_2fa_challenge", request)
         db.commit()
         return {
@@ -247,10 +284,7 @@ def login(data: UserLogin, request: Request, db: Session = Depends(get_db)):
             "temp_token": temp_token,
         }
 
-    access_token = create_access_token(data={"sub": str(user.id)})
-    refresh_token = create_refresh_token(data={"sub": str(user.id)})
-
-    _create_session_record(db, user.id, refresh_token, request)
+    access_token, refresh_token = _create_session_record(db, user.id, request)
     _log_audit(db, user.id, "login", request)
     db.commit()
 
@@ -273,65 +307,55 @@ def me(current_user: User = Depends(get_current_user)):
 
 @router.post("/refresh", response_model=TokenResponse)
 def refresh_token(payload: RefreshTokenRequest, request: Request, db: Session = Depends(get_db)):
-    """Exchange a valid refresh token for a new access + refresh token pair.
-    Implements rotation: old refresh token is revoked, new one issued.
-    """
+    """B06: single-use rotation via one conditional UPDATE. Presenting an already-
+    rotated refresh token (reuse) revokes the whole session."""
     token_data = decode_refresh_token(payload.refresh_token)
     if token_data is None:
-        raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
-
-    user_id = int(token_data.get("sub", 0))
+        raise HTTPException(status_code=401, detail="Invalid, expired or legacy refresh token. Please log in again.")
+    user_id, sid = int(token_data["sub"]), token_data["sid"]
     user = db.query(User).filter(User.id == user_id).first()
     if not user or not user.is_active:
         raise HTTPException(status_code=401, detail="User not found or suspended")
 
-    # Verify the session exists and is not revoked
-    token_hash = hash_token(payload.refresh_token)
-    session = (
-        db.query(SessionModel)
-        .filter(SessionModel.token_hash == token_hash, SessionModel.revoked == False)
-        .first()
-    )
-    if not session:
-        raise HTTPException(status_code=401, detail="Session not found or revoked")
-
-    if session.expires_at < datetime.utcnow():
-        session.revoked = True
+    old_hash = hash_token(payload.refresh_token)
+    claims = {"sub": str(user_id), "sid": sid}
+    new_access = create_access_token(claims)
+    new_refresh = create_refresh_token(claims)
+    now = datetime.utcnow()
+    rows = db.query(SessionModel).filter(
+        SessionModel.sid == sid, SessionModel.user_id == user_id,
+        SessionModel.token_hash == old_hash, SessionModel.revoked == False,
+        SessionModel.expires_at > now,
+    ).update({"token_hash": hash_token(new_refresh), "updated_at": now}, synchronize_session=False)
+    if rows != 1:
+        # Reuse / race loser: revoke the session family so a stolen token dies too.
+        db.query(SessionModel).filter(SessionModel.sid == sid, SessionModel.user_id == user_id).update(
+            {"revoked": True, "revoked_at": now}, synchronize_session=False)
         db.commit()
-        raise HTTPException(status_code=401, detail="Session expired")
-
-    # Rotate: revoke old session, create new
-    session.revoked = True
-    db.flush()  # Ensure revoke is processed before inserting new session
-
-    new_access = create_access_token(data={"sub": str(user.id)})
-    new_refresh = create_refresh_token(data={"sub": str(user.id)})
-    _create_session_record(db, user.id, new_refresh, request)
+        raise HTTPException(status_code=401, detail="Refresh token already used or session revoked")
     _log_audit(db, user.id, "token_refresh", request)
     db.commit()
-
-    return {
-        "access_token": new_access,
-        "refresh_token": new_refresh,
-        "token_type": "bearer",
-    }
+    return {"access_token": new_access, "refresh_token": new_refresh, "token_type": "bearer"}
 
 
 # ── LOGOUT / REVOKE ──
 
 @router.post("/logout")
-def logout(payload: LogoutRequest, db: Session = Depends(get_db)):
-    """Revoke the current session (logout). Invalidates the refresh token."""
-    token_hash = hash_token(payload.refresh_token)
-    session = (
-        db.query(SessionModel)
-        .filter(SessionModel.token_hash == token_hash, SessionModel.revoked == False)
-        .first()
-    )
-    if session:
-        session.revoked = True
-        db.commit()
-    return {"detail": "Logged out successfully"}
+def logout(request: Request, payload: LogoutRequest | None = None,
+           token: str | None = Depends(optional_oauth2), db: Session = Depends(get_db)):
+    """B05: revoke the server-side session named by the bearer access token (and/or
+    the refresh token). After this, the access token is rejected on every route."""
+    revoked = 0
+    now = datetime.utcnow()
+    for claims in (decode_access_token(token) if token else None,
+                   decode_refresh_token(payload.refresh_token) if payload and payload.refresh_token else None):
+        if claims:
+            revoked += db.query(SessionModel).filter(
+                SessionModel.sid == claims["sid"], SessionModel.user_id == int(claims["sub"]),
+                SessionModel.revoked == False,
+            ).update({"revoked": True, "revoked_at": now}, synchronize_session=False)
+    db.commit()
+    return {"detail": "Logged out successfully", "revoked": bool(revoked)}
 
 
 # ── LOGOUT ALL DEVICES ──
@@ -339,10 +363,7 @@ def logout(payload: LogoutRequest, db: Session = Depends(get_db)):
 @router.post("/logout-all")
 def logout_all(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Revoke all sessions for the current user (logout from all devices)."""
-    db.query(SessionModel).filter(
-        SessionModel.user_id == current_user.id,
-        SessionModel.revoked == False
-    ).update({"revoked": True})
+    _revoke_sessions(db, current_user.id)
     db.commit()
     return {"detail": "Logged out from all devices"}
 
@@ -374,11 +395,8 @@ def resend_verification(current_user: User = Depends(get_current_user)):
     if current_user.email_verified:
         return {"detail": "Email already verified"}
     token = create_email_verification_token(current_user.email)
-    # In production: send via email service. In dev: return token for testing.
-    if os.getenv("ENVIRONMENT", "development") != "production":
-        return {"detail": "Verification email sent", "token": token}
-    # TODO: integrate email service (SMTP/SendGrid) to send token to user
-    return {"detail": "Verification email sent"}
+    notification_service.notify_email_verification(current_user.email, token, current_user.name)
+    return {"detail": "Verification email sent"}  # B07: token is never returned
 
 
 # ── PASSWORD RESET ──
@@ -399,12 +417,9 @@ def request_password_reset(payload: PasswordResetRequest, request: Request, db: 
         db.add(reset)
         _log_audit(db, user.id, "password_reset_request", request)
         db.commit()
-        # Send reset notification via email/SMS
+        # B07/B13: token goes only to the user's email; never in the response,
+        # never via the SMS fallback (which logs message text), in ANY environment.
         notification_service.notify_password_reset(user.email, raw_token, user.name)
-        if user.phone:
-            notification_service.send_sms(user.phone, f"DealShield: Your password reset token is: {raw_token}")
-        if os.getenv("ENVIRONMENT", "development") != "production":
-            return {"detail": "If the account exists, a reset link has been sent.", "token": raw_token}
         return {"detail": "If the account exists, a reset link has been sent."}
 
     # Always return success to prevent enumeration
@@ -414,42 +429,35 @@ def request_password_reset(payload: PasswordResetRequest, request: Request, db: 
 
 @router.post("/password-reset/confirm")
 def confirm_password_reset(payload: PasswordResetConfirm, request: Request, db: Session = Depends(get_db)):
-    """Step 2: Confirm password reset with token + new password."""
-    token_hash = hash_token(payload.token)
-    reset = (
-        db.query(PasswordResetToken)
-        .filter(PasswordResetToken.token_hash == token_hash, PasswordResetToken.used == False)
-        .first()
-    )
-
-    if not reset:
-        raise HTTPException(status_code=400, detail="Invalid reset token")
-
-    if reset.expires_at < datetime.utcnow():
-        reset.used = True
-        db.commit()
-        raise HTTPException(status_code=400, detail="Reset token expired")
-
-    user = db.query(User).filter(User.id == reset.user_id).first()
-    if not user or not user.is_active:
-        raise HTTPException(status_code=400, detail="Account not found")
-
+    """B06: the reset token is claimed with one conditional UPDATE (used=False -> True),
+    so two concurrent requests cannot both succeed; a reused token is rejected."""
     is_valid, err_msg = validate_password_strength(payload.new_password)
     if not is_valid:
         raise HTTPException(status_code=400, detail=err_msg)
 
+    token_hash = hash_token(payload.token)
+    now = datetime.utcnow()
+    reset = db.query(PasswordResetToken).filter(PasswordResetToken.token_hash == token_hash).first()
+    if reset is None:
+        raise HTTPException(status_code=400, detail="Invalid reset token")
+    claimed = db.query(PasswordResetToken).filter(
+        PasswordResetToken.id == reset.id, PasswordResetToken.used == False,
+        PasswordResetToken.expires_at > now,
+    ).update({"used": True}, synchronize_session=False)
+    if claimed != 1:
+        db.commit()
+        raise HTTPException(status_code=400, detail="Reset token already used or expired")
+
+    user = db.query(User).filter(User.id == reset.user_id).first()
+    if not user or not user.is_active:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="Account not found")
+
     user.hashed_password = get_password_hash(payload.new_password)
-    user.password_changed_at = datetime.now(timezone.utc)
-    reset.used = True
-
-    # Revoke all existing sessions (force re-login everywhere)
-    db.query(SessionModel).filter(
-        SessionModel.user_id == user.id, SessionModel.revoked == False
-    ).update({"revoked": True})
-
+    user.password_changed_at = now
+    _revoke_user_credentials(db, user.id)  # all sessions + any other reset tokens
     _log_audit(db, user.id, "password_reset", request)
     db.commit()
-
     return {"detail": "Password reset successfully. Please log in again."}
 
 
@@ -470,17 +478,11 @@ def change_password(payload: ChangePasswordRequest, request: Request,
         raise HTTPException(status_code=400, detail="New password must be different from current password")
 
     current_user.hashed_password = get_password_hash(payload.new_password)
-    current_user.password_changed_at = datetime.now(timezone.utc)
-
-    # Revoke all refresh sessions (force re-login on every device)
-    db.query(SessionModel).filter(
-        SessionModel.user_id == current_user.id, SessionModel.revoked == False
-    ).update({"revoked": True})
-
+    current_user.password_changed_at = datetime.utcnow()
+    _revoke_user_credentials(db, current_user.id)  # B05: every session incl. this one
     _log_audit(db, current_user.id, "password_change", request)
     db.commit()
-
-    return {"detail": "Password changed successfully"}
+    return {"detail": "Password changed successfully. Please log in again on all devices."}
 
 
 # ── MANDATORY KYC: submit NIN or BVN (stored encrypted) ──
@@ -504,6 +506,9 @@ def kyc_submit(payload: KYCSubmit, request: Request,
     if not re.match(r"^\+?\d{7,15}$", phone):
         raise HTTPException(status_code=400, detail="A valid phone number is required")
 
+    if current_user.kyc_status == KYC_VERIFIED:
+        raise HTTPException(status_code=400, detail="Identity already verified")
+
     encrypted = encrypt_field(id_number)
 
     if id_type == "nin":
@@ -513,20 +518,22 @@ def kyc_submit(payload: KYCSubmit, request: Request,
 
     current_user.kyc_id_type = id_type
     current_user.kyc_phone_provided = phone
-    current_user.kyc_verified = True
-    current_user.kyc_submitted_at = datetime.now(timezone.utc)
-    if id_type == "nin":
-        current_user.nin_verified = True
-        current_user.id_verified = True
-    else:
-        current_user.bvn_verified = True
-    _update_badge(current_user)
+    current_user.kyc_submitted_at = datetime.utcnow()
+    # B02: format checks are NOT verification. Fail closed: pending until a
+    # provider or a manual reviewer (POST /admin/kyc/{user_id}/decision) decides.
+    status = get_kyc_provider().submit_for_verification(
+        user_id=current_user.id, id_type=id_type, encrypted_id=encrypted, phone=phone)
+    if status == KYC_VERIFIED:  # defence in depth: a stub may never self-verify
+        status = KYC_PENDING
+    current_user.kyc_status = status
+    current_user.kyc_verified = False
 
     _log_audit(db, current_user.id, "kyc_submitted", request)  # no ID number in details
     db.commit()
 
     return {
-        "kyc_verified": True,
+        "kyc_verified": False,
+        "kyc_status": current_user.kyc_status,
         "id_type": id_type,
         "id_masked": mask_field(encrypted),
         "phone_provided": phone,
@@ -538,7 +545,8 @@ def kyc_submit(payload: KYCSubmit, request: Request,
 def kyc_status(current_user: User = Depends(get_current_user)):
     enc = current_user.nin_encrypted or current_user.bvn_encrypted or ""
     return {
-        "kyc_verified": current_user.kyc_verified,
+        "kyc_verified": bool(current_user.kyc_verified) and current_user.kyc_status == KYC_VERIFIED,
+        "kyc_status": current_user.kyc_status or KYC_NONE,
         "id_type": current_user.kyc_id_type,
         "id_masked": mask_field(enc) if enc else None,
         "phone_provided": current_user.kyc_phone_provided,
@@ -548,40 +556,27 @@ def kyc_status(current_user: User = Depends(get_current_user)):
 
 # ── PHONE / NIN / BVN / BUSINESS VERIFICATION (existing) ──
 
+_NO_VERIFIER = "Verification is unavailable: no verification provider is integrated. Use /auth/kyc/submit (reviewed manually)."
+
+
 @router.post("/verify-phone")
-def verify_phone(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    current_user.phone_verified = True
-    db.commit()
-    return {"detail": "Phone verified"}
+def verify_phone(current_user: User = Depends(get_current_user)):
+    raise HTTPException(status_code=503, detail=_NO_VERIFIER)  # B02: no self-verification
 
 
 @router.post("/verify-nin")
-def verify_nin(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    current_user.nin_verified = True
-    current_user.id_verified = True
-    _update_badge(current_user)
-    db.commit()
-    notify_kyc_submitted({"user_id": current_user.id, "name": current_user.name, "phone": current_user.phone})
-    return {"detail": "NIN verified", "badge_tier": current_user.badge_tier}
+def verify_nin(current_user: User = Depends(get_current_user)):
+    raise HTTPException(status_code=503, detail=_NO_VERIFIER)
 
 
 @router.post("/verify-bvn")
-def verify_bvn(bvn_in: VerifyBVN, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    if len(bvn_in.bvn) != 11 or not bvn_in.bvn.isdigit():
-        raise HTTPException(status_code=400, detail="BVN must be 11 digits")
-    current_user.bvn_verified = True
-    _update_badge(current_user)
-    db.commit()
-    return {"detail": "BVN verified", "badge_tier": current_user.badge_tier}
+def verify_bvn(bvn_in: VerifyBVN, current_user: User = Depends(get_current_user)):
+    raise HTTPException(status_code=503, detail=_NO_VERIFIER)
 
 
 @router.post("/verify-business")
-def verify_business(biz_in: VerifyBusiness, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    current_user.business_verified = True
-    current_user.business_name = sanitize_text(biz_in.business_name, max_length=200)
-    _update_badge(current_user)
-    db.commit()
-    return {"detail": "Business verified", "badge_tier": current_user.badge_tier, "business_name": current_user.business_name}
+def verify_business(biz_in: VerifyBusiness, current_user: User = Depends(get_current_user)):
+    raise HTTPException(status_code=503, detail=_NO_VERIFIER)
 
 
 @router.get("/badge/{user_id}")
@@ -643,7 +638,8 @@ def enable_2fa(request: Request, current_user: User = Depends(get_current_user),
 
     # Store the secret (not enabled yet) and backup codes (as JSON in totp_secret field
     # as a pipe-separated value: secret|backup_codes — to keep schema simple)
-    current_user.totp_secret = f"{secret}|{'|'.join(backup_codes)}"
+    # B12: backup codes are stored only as SHA-256 hashes
+    current_user.totp_secret = "|".join([secret] + [hash_token(c) for c in backup_codes])
 
     _log_audit(db, current_user.id, "2fa_enable_initiated", request)
     db.commit()
@@ -671,14 +667,11 @@ def verify_2fa(payload: Verify2FARequest, request: Request, current_user: User =
     if not verify_totp(secret, payload.token):
         raise HTTPException(status_code=400, detail="Invalid TOTP token")
 
-    # Enable 2FA — keep only the secret in totp_secret (backup codes are already given to user)
-    current_user.totp_secret = secret
+    # Enable 2FA; keep the hashed backup codes (B12: they are now usable, once each)
     current_user.totp_enabled = True
 
-    # Security: revoke all other sessions — they predate 2FA and never proved the second factor
-    db.query(SessionModel).filter(
-        SessionModel.user_id == current_user.id, SessionModel.revoked == False
-    ).update({"revoked": True})
+    # B05: 2FA change revokes every session (including this one): log in again with 2FA
+    _revoke_sessions(db, current_user.id)
 
     _log_audit(db, current_user.id, "2fa_enabled", request)
     db.commit()
@@ -692,16 +685,13 @@ def disable_2fa(payload: Disable2FARequest, request: Request, current_user: User
     if not current_user.totp_enabled:
         raise HTTPException(status_code=400, detail="2FA is not enabled")
 
-    if not current_user.totp_secret or not verify_totp(current_user.totp_secret, payload.token):
+    if not current_user.totp_secret or not verify_totp(current_user.totp_secret.split("|")[0], payload.token):
         raise HTTPException(status_code=400, detail="Invalid TOTP token")
 
     current_user.totp_enabled = False
     current_user.totp_secret = None
 
-    # Security: revoke all sessions after 2FA disable — treat as sensitive event
-    db.query(SessionModel).filter(
-        SessionModel.user_id == current_user.id, SessionModel.revoked == False
-    ).update({"revoked": True})
+    _revoke_sessions(db, current_user.id)  # B05
 
     _log_audit(db, current_user.id, "2fa_disabled", request)
     db.commit()
@@ -727,20 +717,32 @@ def login_2fa(payload: Login2FARequest, request: Request, db: Session = Depends(
     if not user.totp_enabled or not user.totp_secret:
         raise HTTPException(status_code=400, detail="2FA is not enabled for this account")
 
-    # Check if it's a backup code (8-char hex) or a TOTP code (6 digits)
-    totp_code = payload.totp_code.strip()
+    # B12: challenge is bound to the password + 2FA secret at issue time
+    if not hmac.compare_digest(str(temp_data.get("cv", "")),
+                               credential_version(user.hashed_password, user.totp_secret)):
+        raise HTTPException(status_code=401, detail="Credentials changed. Please start login again.")
 
+    totp_code = payload.totp_code.strip()
+    stored = user.totp_secret
+    parts = stored.split("|")
     if totp_code.isdigit() and len(totp_code) == 6:
-        # Standard TOTP verification
-        if not verify_totp(user.totp_secret, totp_code):
+        if not verify_totp(parts[0], totp_code):
             raise HTTPException(status_code=401, detail="Invalid TOTP code")
+    elif len(totp_code) == 8 and all(c in "0123456789abcdefABCDEF" for c in totp_code):
+        code_hash = hash_token(totp_code.upper())
+        matched = next((c for c in parts[1:] if hmac.compare_digest(c, code_hash)), None)
+        if matched is None:
+            raise HTTPException(status_code=401, detail="Invalid backup code")
+        remaining = [c for c in parts[1:] if c != matched]
+        rows = db.query(User).filter(User.id == user.id, User.totp_secret == stored).update(
+            {"totp_secret": "|".join([parts[0]] + remaining)}, synchronize_session=False)
+        if rows != 1:
+            db.rollback()
+            raise HTTPException(status_code=401, detail="Backup code already used")
     else:
         raise HTTPException(status_code=401, detail="Invalid TOTP code format")
 
-    access_token = create_access_token(data={"sub": str(user.id)})
-    refresh_token = create_refresh_token(data={"sub": str(user.id)})
-
-    _create_session_record(db, user.id, refresh_token, request)
+    access_token, refresh_token = _create_session_record(db, user.id, request)
     _log_audit(db, user.id, "login_2fa_success", request)
     db.commit()
 
