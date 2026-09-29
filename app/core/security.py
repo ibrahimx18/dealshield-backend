@@ -1,13 +1,11 @@
 import hashlib
 import secrets
 import time
-from passlib.context import CryptContext
+import bcrypt
 from datetime import datetime, timedelta
 from typing import Optional, Tuple
 from jwt import PyJWTError as JWTError, encode as jwt_encode, decode as jwt_decode
 from app.core.config import settings
-
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 # Token type constants for JWT "type" claim
 TOKEN_TYPE_ACCESS = "access"
@@ -16,11 +14,22 @@ TOKEN_TYPE_EMAIL_VERIFY = "email_verify"
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(plain_password, hashed_password)
+    """Native bcrypt (passlib 1.7.4 is incompatible with bcrypt>=4.1). Existing
+    $2b$ hashes created by passlib verify unchanged."""
+    try:
+        password_bytes = plain_password.encode("utf-8")
+        if len(password_bytes) > 72:
+            return False
+        return bcrypt.checkpw(password_bytes, hashed_password.encode("ascii"))
+    except (ValueError, UnicodeError, AttributeError):
+        return False
 
 
 def get_password_hash(password: str) -> str:
-    return pwd_context.hash(password)
+    password_bytes = password.encode("utf-8")
+    if len(password_bytes) > 72:
+        raise ValueError("Password must not exceed 72 UTF-8 bytes")
+    return bcrypt.hashpw(password_bytes, bcrypt.gensalt(rounds=12)).decode("ascii")
 
 
 # ── Access Token (short-lived JWT) ──
