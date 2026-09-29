@@ -1,8 +1,12 @@
-from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, ForeignKey, Enum as SQLEnum, Text
+from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, ForeignKey, Enum as SQLEnum, Text, Numeric, CheckConstraint, UniqueConstraint
+
+# B01/B19: all money is fixed-point NUMERIC(18,2), returned as Decimal. Never Float.
+Money = Numeric(18, 2, asdecimal=True)
 from sqlalchemy.orm import relationship
 from datetime import datetime
 from app.core.database import Base
 import enum
+from decimal import Decimal
 
 
 class CommodityCategory(str, enum.Enum):
@@ -42,20 +46,23 @@ class EscrowStatus(str, enum.Enum):
 
 class User(Base):
     __tablename__ = "users"
+    __table_args__ = (CheckConstraint("wallet_balance >= 0", name="ck_users_wallet_balance_nonneg"),)
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, nullable=False)
     phone = Column(String, nullable=False, index=True)
     email = Column(String, nullable=False, unique=True, index=True)
     hashed_password = Column(String, nullable=False)
-    wallet_balance = Column(Float, default=0.0)
+    wallet_balance = Column(Money, default=Decimal("0.00"))
     nin_verified = Column(Boolean, default=False)
     nin_encrypted = Column(Text, nullable=True)   # AES-256-GCM ciphertext, never plaintext
     bvn_encrypted = Column(Text, nullable=True)   # AES-256-GCM ciphertext, never plaintext
     kyc_verified = Column(Boolean, default=False, nullable=False)
+    # B02: none | pending_verification | verified | rejected. Only a provider/reviewer sets 'verified'.
+    kyc_status = Column(String(32), default="none", nullable=False)
     kyc_submitted_at = Column(DateTime, nullable=True)
     kyc_id_type = Column(String, nullable=True)  # "nin" | "bvn"
     kyc_phone_provided = Column(String, nullable=True)
-    phone_verified = Column(Boolean, default=True)
+    phone_verified = Column(Boolean, default=False)
     email_verified = Column(Boolean, default=False, nullable=False)  # NEW: email verification flag
     id_verified = Column(Boolean, default=False)
     bvn_verified = Column(Boolean, default=False)
@@ -82,11 +89,12 @@ class User(Base):
 
 class Listing(Base):
     __tablename__ = "listings"
+    __table_args__ = (CheckConstraint("price > 0", name="ck_listings_price_pos"),)
     id = Column(Integer, primary_key=True, index=True)
     category = Column(String, nullable=False)
     title = Column(String, nullable=False, index=True)
     description = Column(String, default="")
-    price = Column(Float, nullable=False)
+    price = Column(Money, nullable=False)
     location = Column(String, default="")
     seller_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     seller_name = Column(String, default="")
@@ -101,12 +109,18 @@ class Listing(Base):
 
 class EscrowTransaction(Base):
     __tablename__ = "escrow_transactions"
+    __table_args__ = (
+        CheckConstraint("amount > 0", name="ck_escrow_amount_pos"),
+        CheckConstraint("commission >= 0", name="ck_escrow_commission_nonneg"),
+        CheckConstraint("coalesce(facilitator_fee, 0) >= 0", name="ck_escrow_fac_fee_nonneg"),
+        CheckConstraint("coalesce(insurance_fee, 0) >= 0", name="ck_escrow_insurance_nonneg"),
+    )
     id = Column(Integer, primary_key=True, index=True)
     listing_id = Column(Integer, ForeignKey("listings.id"), nullable=True)  # nullable for facilitated deals
     listing_title = Column(String, nullable=False)
     category = Column(String, nullable=False)
-    amount = Column(Float, nullable=False)
-    commission = Column(Float, nullable=False)
+    amount = Column(Money, nullable=False)
+    commission = Column(Money, nullable=False)
     status = Column(String, default="created")
     buyer_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     seller_id = Column(Integer, ForeignKey("users.id"), nullable=False)
@@ -117,7 +131,7 @@ class EscrowTransaction(Base):
     insured = Column(Boolean, default=False)
     logistics_provider = Column(String, default="")
     tracking_number = Column(String, default="")
-    insurance_fee = Column(Float, default=0)
+    insurance_fee = Column(Money, default=Decimal("0.00"))
     pickup_otp = Column(String, default="")  # 6-digit OTP for rider pickup
     rider_phone = Column(String, default="")  # dispatch rider's phone
     rider_name = Column(String, default="")
@@ -147,19 +161,19 @@ class EscrowTransaction(Base):
     # ── Facilitator columns ──
     facilitator_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     facilitator_name = Column(String, default="")
-    facilitator_fee = Column(Float, default=0.0)           # total fee the facilitator charges buyer/seller for brokering
-    dealshield_cut = Column(Float, default=0.0)            # 10% of facilitator fee — DealShield's share
-    facilitator_payout = Column(Float, default=0.0)        # 90% of facilitator fee — what facilitator receives
-    cancellation_fee = Column(Float, default=0.0)          # ₦5,000 flat fee deducted on cancel/dispute, credited to DealShield
+    facilitator_fee = Column(Money, default=Decimal("0.00"))           # total fee the facilitator charges buyer/seller for brokering
+    dealshield_cut = Column(Money, default=Decimal("0.00"))            # 10% of facilitator fee — DealShield's share
+    facilitator_payout = Column(Money, default=Decimal("0.00"))        # 90% of facilitator fee — what facilitator receives
+    cancellation_fee = Column(Money, default=Decimal("0.00"))          # ₦5,000 flat fee deducted on cancel/dispute, credited to DealShield
     buyer_accepted_terms = Column(Boolean, default=False)
     seller_accepted_terms = Column(Boolean, default=False)
     buyer_accepted_at = Column(DateTime, nullable=True)
     seller_accepted_at = Column(DateTime, nullable=True)
     is_facilitated = Column(Boolean, default=False)
     # ── Gateway fees (split 50/50 between buyer and seller) ──
-    gateway_fee = Column(Float, default=0.0)             # total payment gateway fee
-    buyer_gateway_share = Column(Float, default=0.0)     # buyer's portion (paid on funding)
-    seller_gateway_share = Column(Float, default=0.0)    # seller's portion (deducted on release)
+    gateway_fee = Column(Money, default=Decimal("0.00"))             # total payment gateway fee
+    buyer_gateway_share = Column(Money, default=Decimal("0.00"))     # buyer's portion (paid on funding)
+    seller_gateway_share = Column(Money, default=Decimal("0.00"))    # seller's portion (deducted on release)
     # ── Release OTP (buyer enters code to release funds) ──
     release_otp = Column(String, default="")              # 6-digit OTP generated when buyer_review starts
     release_otp_expiry = Column(DateTime, nullable=True)  # OTP validity window
@@ -171,7 +185,7 @@ class WalletTx(Base):
     __tablename__ = "wallet_transactions"
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    amount = Column(Float, nullable=False)
+    amount = Column(Money, nullable=False)
     type = Column(String, nullable=False)  # deposit, withdraw, escrow_hold, escrow_release, escrow_refund
     description = Column(String, default="")
     timestamp = Column(DateTime, default=datetime.utcnow)
@@ -184,10 +198,11 @@ class PaymentReference(Base):
     for the user who created it (prevents replay / idempotency abuse).
     """
     __tablename__ = "payment_references"
+    __table_args__ = (CheckConstraint("amount > 0", name="ck_payref_amount_pos"),)
     id = Column(Integer, primary_key=True, index=True)
     reference = Column(String, unique=True, index=True, nullable=False)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    amount = Column(Float, nullable=False)
+    amount = Column(Money, nullable=False)
     provider = Column(String, nullable=False, default="")
     status = Column(String, nullable=False, default="pending")  # pending -> consumed
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -221,12 +236,13 @@ class Review(Base):
 
 class PaymentLink(Base):
     __tablename__ = "payment_links"
+    __table_args__ = (CheckConstraint("amount > 0", name="ck_paylink_amount_pos"),)
     id = Column(Integer, primary_key=True, index=True)
     link_code = Column(String, unique=True, index=True, nullable=False)
     seller_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     title = Column(String, nullable=False)
     description = Column(String, default="")
-    amount = Column(Float, nullable=False)
+    amount = Column(Money, nullable=False)
     category = Column(String, default="general")
     status = Column(String, default="active")  # active, paid, expired
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -241,7 +257,7 @@ class ProcessedPayment(Base):
     reference = Column(String, unique=True, index=True, nullable=False)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     provider = Column(String, nullable=False)
-    amount = Column(Float, nullable=False)
+    amount = Column(Money, nullable=False)
     processed_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -269,6 +285,9 @@ class Session(Base):
     user_agent = Column(Text, nullable=True)
     expires_at = Column(DateTime, nullable=False)
     revoked = Column(Boolean, default=False, nullable=False)
+    revoked_at = Column(DateTime, nullable=True)
+    # B05: random public id embedded in every access/refresh JWT as "sid".
+    sid = Column(String(64), unique=True, index=True, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -314,9 +333,50 @@ class VirtualAccount(Base):
     account_name = Column(String, nullable=False)
     provider = Column(String, nullable=False, default="dealshield")
     status = Column(String, nullable=False, default="active")  # active, expired, paid
-    expected_amount = Column(Float, nullable=False, default=0.0)
+    expected_amount = Column(Money, nullable=False, default=Decimal("0.00"))
     expires_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     escrow_tx = relationship("EscrowTransaction", backref="virtual_accounts")
+
+
+class PaymentWebhookEvent(Base):
+    """B04: one row per provider event, for idempotency and reconciliation.
+    UNIQUE(provider, event_id) and UNIQUE(provider, reference) make replays no-ops.
+    """
+    __tablename__ = "payment_webhook_events"
+    __table_args__ = (
+        UniqueConstraint("provider", "event_id", name="uq_webhook_provider_event"),
+        UniqueConstraint("provider", "reference", name="uq_webhook_provider_reference"),
+    )
+    id = Column(Integer, primary_key=True, index=True)
+    provider = Column(String(32), nullable=False)
+    event_id = Column(String(128), nullable=False)
+    reference = Column(String(128), nullable=False)
+    event_type = Column(String(64), nullable=False)
+    escrow_tx_id = Column(Integer, ForeignKey("escrow_transactions.id"), nullable=True)
+    amount = Column(Money, nullable=True)
+    currency = Column(String(8), nullable=True)
+    status = Column(String(32), nullable=False, default="received")  # applied | quarantined | ignored
+    reason = Column(Text, default="")
+    received_at = Column(DateTime, default=datetime.utcnow)
+
+
+class WebhookQuarantine(Base):
+    """B04: signed events that did not reconcile (amount/currency/reference mismatch).
+    No funds move; an operator must review these rows.
+    """
+    __tablename__ = "webhook_quarantine"
+    id = Column(Integer, primary_key=True, index=True)
+    provider = Column(String(32), nullable=False)
+    event_id = Column(String(128), nullable=True)
+    reference = Column(String(128), nullable=True)
+    event_type = Column(String(64), nullable=True)
+    escrow_tx_id = Column(Integer, nullable=True)
+    expected_amount = Column(Money, nullable=True)
+    received_amount = Column(Money, nullable=True)
+    currency = Column(String(8), nullable=True)
+    reason = Column(Text, nullable=False)
+    payload_sha256 = Column(String(64), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)

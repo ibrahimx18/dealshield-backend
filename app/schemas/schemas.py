@@ -1,4 +1,6 @@
-from pydantic import BaseModel, EmailStr
+from decimal import Decimal
+from pydantic import BaseModel, EmailStr, Field
+from app.core.money import Money, NonNegMoney
 from typing import Optional, List, Any
 from datetime import datetime
 
@@ -18,10 +20,12 @@ class UserProfile(BaseModel):
     name: str
     phone: str
     email: str
-    wallet_balance: float
+    wallet_balance: Decimal
     nin_verified: bool
     phone_verified: bool
     email_verified: bool = False  # NEW
+    totp_enabled: bool = False
+    kyc_status: str = "none"
     id_verified: bool
     bvn_verified: bool = False
     business_verified: bool = False
@@ -71,7 +75,8 @@ class ChangePasswordRequest(BaseModel):
 
 
 class LogoutRequest(BaseModel):
-    refresh_token: str
+    # B05: optional - logout is authorised by the bearer access token's session.
+    refresh_token: Optional[str] = None
 
 
 class Enable2FAResponse(BaseModel):
@@ -101,7 +106,7 @@ class ListingCreate(BaseModel):
     category: str
     title: str
     description: str = ""
-    price: float
+    price: Money  # B01: Decimal, >0, <=MAX_AMOUNT, 2dp
     location: str = ""
     insured: bool = False
 
@@ -110,7 +115,7 @@ class ListingOut(BaseModel):
     category: str
     title: str
     description: str
-    price: float
+    price: Decimal
     location: str
     seller_name: str
     seller_rating: str
@@ -126,7 +131,7 @@ class ListingListResponse(BaseModel):
 class EscrowCreate(BaseModel):
     listing_id: Any
     insured: bool = False
-    bag_count: Optional[int] = None  # For cement category (600, 900 bags etc.)
+    bag_count: Optional[int] = Field(default=None, gt=0, le=100000)  # B01: positive, bounded
 
 class EscrowShip(BaseModel):
     logistics_provider: str = ""
@@ -147,8 +152,8 @@ class EscrowOut(BaseModel):
     listing_id: Any
     listing_title: str
     category: str
-    amount: float
-    commission: float
+    amount: Decimal
+    commission: Decimal
     status: str
     buyer_id: Any
     seller_id: Any
@@ -159,7 +164,7 @@ class EscrowOut(BaseModel):
     insured: bool
     logistics_provider: Optional[str] = None
     tracking_number: Optional[str] = None
-    insurance_fee: float = 0
+    insurance_fee: Decimal = Decimal("0.00")
     # New flow fields
     accepted_at: Optional[datetime] = None
     funded_at: Optional[datetime] = None
@@ -178,14 +183,15 @@ class EscrowOut(BaseModel):
     is_facilitated: bool = False
     facilitator_id: Optional[int] = None
     facilitator_name: Optional[str] = None
-    facilitator_fee: float = 0.0
-    dealshield_cut: float = 0.0
-    facilitator_payout: float = 0.0
+    facilitator_fee: Decimal = Decimal("0.00")
+    dealshield_cut: Decimal = Decimal("0.00")
+    facilitator_payout: Decimal = Decimal("0.00")
     buyer_accepted_terms: bool = False
     seller_accepted_terms: bool = False
-    gateway_fee: float = 0.0
-    buyer_gateway_share: float = 0.0
-    seller_gateway_share: float = 0.0
+    gateway_fee: Decimal = Decimal("0.00")
+    buyer_gateway_share: Decimal = Decimal("0.00")
+    seller_gateway_share: Decimal = Decimal("0.00")
+    cancellation_fee: Decimal = Decimal("0.00")
     # Release OTP
     release_otp: Optional[str] = None
     release_otp_expiry: Optional[datetime] = None
@@ -205,8 +211,8 @@ class FacilitatedDealCreate(BaseModel):
     """
     title: str
     category: str  # cars, gold, dollars, land, crypto, etc.
-    deal_amount: float         # amount agreed between buyer and seller for the goods
-    facilitator_fee: float      # fee the facilitator charges for brokering (agreed with buyer/seller)
+    deal_amount: Money             # B01: >0, bounded, 2dp
+    facilitator_fee: NonNegMoney   # B01: >=0, bounded, 2dp
     buyer_phone: str            # buyer's phone (must be registered)
     seller_phone: str           # seller's phone (must be registered)
     description: str = ""
@@ -224,14 +230,14 @@ class ReleaseOTPRequest(BaseModel):
 
 # === WALLET ===
 class WalletDeposit(BaseModel):
-    amount: float
+    amount: Money
 
 class WalletBalanceResponse(BaseModel):
-    balance: float
+    balance: Decimal
 
 class WalletTxOut(BaseModel):
     id: int
-    amount: float
+    amount: Decimal
     type: str
     description: str
     timestamp: datetime
@@ -277,7 +283,7 @@ class ReviewListResponse(BaseModel):
 class PaymentLinkCreate(BaseModel):
     title: str
     description: str = ""
-    amount: float
+    amount: Money
     category: str = "general"
 
 class PaymentLinkOut(BaseModel):
@@ -287,7 +293,7 @@ class PaymentLinkOut(BaseModel):
     seller_name: Optional[str] = None
     title: str
     description: str
-    amount: float
+    amount: Decimal
     category: str
     status: str
     created_at: datetime
@@ -298,7 +304,7 @@ class PaymentLinkListResponse(BaseModel):
 
 # === PAYMENT (Paystack/Flutterwave) ===
 class InitializePayment(BaseModel):
-    amount: float
+    amount: Money
     email: str
     provider: str = "paystack"  # paystack or flutterwave
 
@@ -321,7 +327,7 @@ class VirtualAccountOut(BaseModel):
     account_name: str
     provider: str
     status: str
-    expected_amount: float
+    expected_amount: Decimal
     expires_at: Optional[datetime] = None
     created_at: datetime
     updated_at: Optional[datetime] = None
@@ -341,6 +347,7 @@ class KYCSubmit(BaseModel):
 
 class KYCStatus(BaseModel):
     kyc_verified: bool
+    kyc_status: str = "none"  # none | pending_verification | verified | rejected
     id_type: str | None = None
     id_masked: str | None = None
     phone_provided: str | None = None

@@ -11,10 +11,11 @@ Flow:
   Exit paths: CANCELLED (before funding), EXPIRED (deadlines), CLOSED (terminal)
 """
 import json
-import random
+import random  # only used by the legacy account generator (removed in B03 commit)
 import hashlib
 import hmac
 import secrets
+from decimal import Decimal
 from fastapi import APIRouter, Depends, HTTPException, Request, Header
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta, timezone
@@ -43,18 +44,20 @@ from app.routers.auth import get_current_user, _update_badge
 from app.core.config import settings
 from app.core.notifications import notify_escrow_event
 from app.core.security_middleware import sanitize_text
+from app.core.money import q, require_amount, money_out, to_decimal, ZERO, MAX_AMOUNT
+from app.core.wallet import debit_wallet, credit_wallet
 
 router = APIRouter()
 
 # Insurance fee: 1.5% of item value
-INSURANCE_RATE = 0.015
+INSURANCE_RATE = Decimal("0.015")
 # Gateway fee: 1.5% of total (Paystack/Flutterwave standard), capped at ₦50,000
-GATEWAY_FEE_RATE = 0.015
-GATEWAY_FEE_CAP = 50000.0
+GATEWAY_FEE_RATE = Decimal("0.015")
+GATEWAY_FEE_CAP = Decimal("50000.00")
 
 # Cancellation/Dispute flat fee — DealShield charges ₦5,000 when a funded deal
 # is cancelled or a dispute results in refund/split. Deducted from buyer's refund.
-CANCELLATION_FEE = 5000.0
+CANCELLATION_FEE = Decimal("5000.00")
 
 # Deadline constants
 ACCEPT_DEADLINE_HOURS = 48       # Seller must accept within 48h
@@ -62,19 +65,66 @@ PAYMENT_DEADLINE_HOURS = 24      # Buyer must fund within 24h after seller accep
 BUYER_REVIEW_DAYS = 1             # Auto-release after 24 hours if buyer is silent
 
 
-def _calc_gateway_fee(amount: float) -> float:
-    """Calculate payment gateway fee: 1.5% of amount, capped at ₦50,000."""
-    return round(min(amount * GATEWAY_FEE_RATE, GATEWAY_FEE_CAP), 2)
+def _calc_gateway_fee(amount) -> Decimal:
+    """Payment gateway fee: 1.5% of amount, capped at NGN 50,000 (Decimal, 2dp)."""
+    return q(min(to_decimal(amount) * GATEWAY_FEE_RATE, GATEWAY_FEE_CAP))
 
 
-def _tx_dict(tx: EscrowTransaction) -> dict:
+def _new_otp() -> str:
+    return str(secrets.randbelow(1_000_000)).zfill(6)
+
+
+def _transition(db: Session, tx: EscrowTransaction, values: dict, from_status: str | None = None):
+    """Conditional state change: UPDATE ... WHERE id=:id AND status=:current.
+    Raises 409 if another request changed the row first (B08)."""
+    current = from_status or tx.status
+    rows = db.query(EscrowTransaction).filter(
+        EscrowTransaction.id == tx.id, EscrowTransaction.status == current,
+    ).update(values, synchronize_session=False)
+    if rows != 1:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Transaction status changed concurrently")
+    db.flush()
+    db.refresh(tx)
+
+
+def _buyer_total(tx: EscrowTransaction) -> Decimal:
+    """Principal (+facilitator fee) + insurance, before gateway share."""
+    total = to_decimal(tx.amount) + to_decimal(tx.insurance_fee)
+    if tx.is_facilitated:
+        total += to_decimal(tx.facilitator_fee)
+    return q(total)
+
+
+def _funding_quote(tx: EscrowTransaction) -> dict:
+    """Server-authoritative funding amounts with invariant checks (B01)."""
+    require_amount(tx.amount, what="Deal amount")
+    require_amount(tx.insurance_fee or 0, allow_zero=True, what="Insurance fee")
+    require_amount(tx.facilitator_fee or 0, allow_zero=True, what="Facilitator fee")
+    require_amount(tx.commission or 0, allow_zero=True, what="Commission")
+    total = _buyer_total(tx)
+    gateway_fee = _calc_gateway_fee(total)
+    buyer_share = q(gateway_fee / 2)
+    seller_share = q(gateway_fee - buyer_share)
+    commission = ZERO if tx.is_facilitated else to_decimal(tx.commission)
+    seller_payout = q(to_decimal(tx.amount) - commission - seller_share)
+    if seller_payout < 0:
+        raise HTTPException(status_code=400, detail="Fees must not exceed the seller payout")
+    total_with_gateway = require_amount(total + buyer_share, what="Funding total")
+    return {"total": total, "gateway_fee": gateway_fee, "buyer_gateway_share": buyer_share,
+            "seller_gateway_share": seller_share, "total_with_gateway": total_with_gateway,
+            "seller_payout": seller_payout}
+
+
+def _tx_dict(tx: EscrowTransaction, viewer_id: int | None = None) -> dict:
+    m = money_out
     return {
         "id": tx.id,
         "listing_id": tx.listing_id,
         "listing_title": tx.listing_title,
         "category": tx.category,
-        "amount": tx.amount,
-        "commission": tx.commission,
+        "amount": m(tx.amount),
+        "commission": m(tx.commission),
         "status": tx.status,
         "buyer_id": tx.buyer_id,
         "seller_id": tx.seller_id,
@@ -85,7 +135,7 @@ def _tx_dict(tx: EscrowTransaction) -> dict:
         "insured": tx.insured,
         "logistics_provider": tx.logistics_provider or "",
         "tracking_number": tx.tracking_number or "",
-        "insurance_fee": tx.insurance_fee or 0,
+        "insurance_fee": m(tx.insurance_fee),
         "accepted_at": tx.accepted_at.isoformat() if tx.accepted_at else None,
         "funded_at": tx.funded_at.isoformat() if tx.funded_at else None,
         "fulfilment_started_at": tx.fulfilment_started_at.isoformat() if tx.fulfilment_started_at else None,
@@ -102,131 +152,112 @@ def _tx_dict(tx: EscrowTransaction) -> dict:
         "is_facilitated": tx.is_facilitated,
         "facilitator_id": tx.facilitator_id,
         "facilitator_name": tx.facilitator_name or "",
-        "facilitator_fee": tx.facilitator_fee or 0.0,
-        "dealshield_cut": tx.dealshield_cut or 0.0,
-        "facilitator_payout": tx.facilitator_payout or 0.0,
-        "cancellation_fee": tx.cancellation_fee or 0.0,
-        "gateway_fee": tx.gateway_fee or 0.0,
-        "buyer_gateway_share": tx.buyer_gateway_share or 0.0,
-        "seller_gateway_share": tx.seller_gateway_share or 0.0,
+        "facilitator_fee": m(tx.facilitator_fee),
+        "dealshield_cut": m(tx.dealshield_cut),
+        "facilitator_payout": m(tx.facilitator_payout),
+        "cancellation_fee": m(tx.cancellation_fee),
+        "gateway_fee": m(tx.gateway_fee),
+        "buyer_gateway_share": m(tx.buyer_gateway_share),
+        "seller_gateway_share": m(tx.seller_gateway_share),
         "buyer_accepted_terms": tx.buyer_accepted_terms,
         "seller_accepted_terms": tx.seller_accepted_terms,
-        "gateway_fee": tx.gateway_fee or 0.0,
-        "buyer_gateway_share": tx.buyer_gateway_share or 0.0,
-        "seller_gateway_share": tx.seller_gateway_share or 0.0,
-        "release_otp": tx.release_otp or "",
+        # B16: the release OTP is only ever shown to the buyer.
+        "release_otp": (tx.release_otp or "") if viewer_id is not None and viewer_id == tx.buyer_id else "",
         "release_otp_expiry": tx.release_otp_expiry.isoformat() if tx.release_otp_expiry else None,
         "share_token": tx.share_token or "",
     }
 
 
-def _log_audit(db: Session, actor_id: int, action: str, request: Request,
+def _log_audit(db: Session, actor_id: int | None, action: str, request: Request | None,
               target_type: str = "escrow_transaction", target_id: int | None = None, details: str = ""):
+    # B18: system actions use actor_id=None (never 0, which violates the FK).
     log = AuditLog(
         actor_id=actor_id, action=action, target_type=target_type,
         target_id=target_id,
-        ip_address=request.client.host if request.client else None,
+        ip_address=request.client.host if request is not None and request.client else None,
         details=details,
     )
     db.add(log)
 
 
-def _calc_commission(category: str, price: float, bag_count: int | None = None) -> float:
+def _calc_commission(category: str, price, bag_count: int | None = None) -> Decimal:
+    price = require_amount(price, what="Price")
     if category == "cement":
         bags = bag_count or 600
-        return float(bags * 10)
-    if price < 500000:
-        return round(price * 0.015, 2)
-    elif price < 5000000:
-        return round(price * 0.010, 2)
-    elif price < 20000000:
-        return round(price * 0.005, 2)
-    return 100000.0  # Max cap
+        if bags <= 0:
+            raise HTTPException(status_code=400, detail="bag_count must be positive")
+        commission = q(Decimal(bags) * 10)
+    elif price < Decimal("500000"):
+        commission = q(price * Decimal("0.015"))
+    elif price < Decimal("5000000"):
+        commission = q(price * Decimal("0.010"))
+    elif price < Decimal("20000000"):
+        commission = q(price * Decimal("0.005"))
+    else:
+        commission = Decimal("100000.00")  # Max cap
+    if commission < 0 or commission > price:
+        raise HTTPException(status_code=400, detail="Commission must not exceed the deal amount")
+    return commission
 
 
 def _release_funds(db: Session, tx: EscrowTransaction):
-    """Release escrow funds.
-    Normal deal: seller gets amount - commission.
-    Facilitated deal: seller gets full deal amount, facilitator gets 90% of their fee,
-    DealShield keeps 10% of the facilitator's fee.
+    """Release escrow funds (atomic credits, B08).
+    Normal deal: seller gets amount - commission - seller gateway share.
+    Facilitated deal: seller gets amount - seller gateway share; facilitator 90% of fee, DealShield 10%.
     """
     seller = db.query(User).filter(User.id == tx.seller_id).first()
     buyer = db.query(User).filter(User.id == tx.buyer_id).first()
+    commission = ZERO if tx.is_facilitated else to_decimal(tx.commission)
+    seller_payout = q(to_decimal(tx.amount) - commission - to_decimal(tx.seller_gateway_share))
+    if seller_payout < 0:
+        raise HTTPException(status_code=400, detail="Seller payout would be negative")
 
-    if tx.is_facilitated:
-        # Facilitated deal: no escrow commission, facilitator fee is split 90/10
-        # Seller gateway share is deducted from payout
-        seller_payout = tx.amount - (tx.seller_gateway_share or 0)
-        seller.wallet_balance += seller_payout
-        seller.total_deals += 1
-        buyer.total_deals += 1
-        _update_badge(seller)
-        _update_badge(buyer)
-        db.add(WalletTx(
-            user_id=seller.id, amount=seller_payout, type="escrow_release",
-            description=f"Escrow release for {tx.listing_title} (facilitated)"
-        ))
+    credit_wallet(db, seller.id, seller_payout)
+    seller.total_deals = (seller.total_deals or 0) + 1
+    buyer.total_deals = (buyer.total_deals or 0) + 1
+    _update_badge(seller)
+    _update_badge(buyer)
+    db.add(WalletTx(
+        user_id=seller.id, amount=seller_payout, type="escrow_release",
+        description=f"Escrow release for {tx.listing_title}" + (" (facilitated)" if tx.is_facilitated else "")
+    ))
 
-        # Calculate facilitator payout: 90% to facilitator, 10% to DealShield
-        if tx.facilitator_fee and tx.facilitator_fee > 0:
-            dealshield_cut = round(tx.facilitator_fee * 0.10, 2)
-            facilitator_payout = round(tx.facilitator_fee * 0.90, 2)
-            tx.dealshield_cut = dealshield_cut
-            tx.facilitator_payout = facilitator_payout
-
-            if tx.facilitator_id:
-                facilitator = db.query(User).filter(User.id == tx.facilitator_id).first()
-                if facilitator:
-                    facilitator.wallet_balance += facilitator_payout
-                    db.add(WalletTx(
-                        user_id=facilitator.id, amount=facilitator_payout, type="facilitator_payout",
-                        description=f"Facilitator payout for {tx.listing_title} (90% of ₦{tx.facilitator_fee:,.0f} fee)"
-                    ))
-    else:
-        # Normal deal: seller gets amount minus commission minus seller gateway share
-        seller_payout = tx.amount - tx.commission - (tx.seller_gateway_share or 0)
-        seller.wallet_balance += seller_payout
-        seller.total_deals += 1
-        buyer.total_deals += 1
-        _update_badge(seller)
-        _update_badge(buyer)
-        db.add(WalletTx(
-            user_id=seller.id, amount=seller_payout, type="escrow_release",
-            description=f"Escrow release for {tx.listing_title}"
-        ))
+    fee = to_decimal(tx.facilitator_fee)
+    if tx.is_facilitated and fee > 0:
+        dealshield_cut = q(fee * Decimal("0.10"))
+        facilitator_payout = q(fee - dealshield_cut)
+        tx.dealshield_cut = q(to_decimal(tx.dealshield_cut) + dealshield_cut)
+        tx.facilitator_payout = facilitator_payout
+        if tx.facilitator_id:
+            facilitator = db.query(User).filter(User.id == tx.facilitator_id).first()
+            if facilitator:
+                credit_wallet(db, facilitator.id, facilitator_payout)
+                db.add(WalletTx(
+                    user_id=facilitator.id, amount=facilitator_payout, type="facilitator_payout",
+                    description=f"Facilitator payout for {tx.listing_title} (90% of NGN {fee:,.2f} fee)"
+                ))
 
 
-def _refund_buyer(db: Session, tx: EscrowTransaction, partial_amount: float | None = None):
-    """Refund buyer (full or partial), minus ₦5,000 cancellation fee for funded deals.
-
-    Facilitated deal: refund = deal_amount + facilitator_fee + insurance + buyer_gateway_share - cancellation_fee.
-    Normal deal: refund = amount + insurance + buyer_gateway_share - cancellation_fee.
-
-    The ₦5,000 cancellation_fee is credited to DealShield's revenue and recorded on the tx.
-    """
+def _refund_buyer(db: Session, tx: EscrowTransaction, partial_amount=None):
+    """Refund buyer (full or partial), minus the NGN 5,000 cancellation fee for funded deals."""
     buyer = db.query(User).filter(User.id == tx.buyer_id).first()
     if partial_amount is not None:
-        refund = partial_amount
-    elif tx.is_facilitated:
-        refund = tx.amount + tx.facilitator_fee + (tx.insurance_fee or 0) + (tx.buyer_gateway_share or 0)
+        refund = require_amount(partial_amount, allow_zero=True, what="Refund")
     else:
-        refund = tx.amount + (tx.insurance_fee or 0) + (tx.buyer_gateway_share or 0)
+        refund = q(_buyer_total(tx) + to_decimal(tx.buyer_gateway_share))
 
-    # Deduct flat cancellation fee from buyer's refund, credit to DealShield
     if refund > CANCELLATION_FEE:
-        refund -= CANCELLATION_FEE
+        refund = q(refund - CANCELLATION_FEE)
         tx.cancellation_fee = CANCELLATION_FEE
-        tx.dealshield_cut = (tx.dealshield_cut or 0) + CANCELLATION_FEE
     else:
-        # If refund is less than the fee, take what's available
         tx.cancellation_fee = refund
-        tx.dealshield_cut = (tx.dealshield_cut or 0) + refund
-        refund = 0.0
+        refund = ZERO
+    tx.dealshield_cut = q(to_decimal(tx.dealshield_cut) + to_decimal(tx.cancellation_fee))
 
-    buyer.wallet_balance += refund
+    credit_wallet(db, buyer.id, refund)
     db.add(WalletTx(
         user_id=buyer.id, amount=refund, type="escrow_refund",
-        description=f"Escrow refund for {tx.listing_title} (₦{tx.cancellation_fee:,.0f} cancellation fee deducted)"
+        description=f"Escrow refund for {tx.listing_title} (NGN {to_decimal(tx.cancellation_fee):,.2f} cancellation fee deducted)"
     ))
 
 
@@ -254,18 +285,17 @@ def create_escrow(escrow_in: EscrowCreate, request: Request,
             detail="Identity verification required before you can transact. Submit your NIN or BVN via /auth/kyc/submit.",
         )
 
-    insurance_fee = 0
-    if escrow_in.insured:
-        insurance_fee = round(listing.price * INSURANCE_RATE, 2)
+    price = require_amount(listing.price, what="Listing price")  # B01 service-layer re-check
+    insurance_fee = q(price * INSURANCE_RATE) if escrow_in.insured else ZERO
 
-    commission = _calc_commission(listing.category, listing.price, escrow_in.bag_count)
+    commission = _calc_commission(listing.category, price, escrow_in.bag_count)
 
     now = datetime.utcnow()
     tx = EscrowTransaction(
         listing_id=listing.id,
         listing_title=listing.title,
         category=listing.category,
-        amount=listing.price,
+        amount=price,
         commission=commission,
         status="created",
         buyer_id=current_user.id,
@@ -284,7 +314,7 @@ def create_escrow(escrow_in: EscrowCreate, request: Request,
     db.commit()
     db.refresh(tx)
     notify_escrow_event(_tx_dict(tx), "escrow_created")
-    return _tx_dict(tx)
+    return _tx_dict(tx, current_user.id)
 
 
 # ── 2. ACCEPT — Seller accepts the deal ──
@@ -298,25 +328,26 @@ def seller_accept(tx_id: int, request: Request,
         raise HTTPException(status_code=404, detail="Transaction not found")
     if tx.seller_id != current_user.id:
         raise HTTPException(status_code=403, detail="Only the seller can accept")
+    if tx.is_facilitated:
+        # B14: facilitated deals need both stored consents via /accept-terms
+        raise HTTPException(status_code=400, detail="Facilitated deals require both parties to accept via accept-terms")
     if tx.status != "created":
-        raise HTTPException(status_code=400, detail=f"Cannot accept — current status: {tx.status}")
+        raise HTTPException(status_code=400, detail=f"Cannot accept - current status: {tx.status}")
 
     now = datetime.utcnow()
     if tx.accept_deadline and now > _strip_tz(tx.accept_deadline):
-        tx.status = "expired"
-        tx.closed_at = now
+        _transition(db, tx, {"status": "expired", "closed_at": now})
         db.commit()
         raise HTTPException(status_code=400, detail="Accept deadline expired")
 
-    tx.status = "seller_accepted"
-    tx.accepted_at = now
-    tx.payment_deadline = now + timedelta(hours=PAYMENT_DEADLINE_HOURS)
+    _transition(db, tx, {"status": "seller_accepted", "accepted_at": now,
+                         "payment_deadline": now + timedelta(hours=PAYMENT_DEADLINE_HOURS)})
 
     _log_audit(db, current_user.id, "escrow_accept", request, target_id=tx.id)
     db.commit()
     db.refresh(tx)
     notify_escrow_event(_tx_dict(tx), "escrow_accepted")
-    return _tx_dict(tx)
+    return _tx_dict(tx, current_user.id)
 
 
 # ── 3. DECLINE — Seller declines the deal ──
@@ -334,8 +365,7 @@ def seller_decline(tx_id: int, request: Request,
         raise HTTPException(status_code=400, detail=f"Cannot decline — current status: {tx.status}")
 
     now = datetime.utcnow()
-    tx.status = "seller_declined"
-    tx.closed_at = now
+    _transition(db, tx, {"status": "seller_declined", "closed_at": now})
 
     _log_audit(db, current_user.id, "escrow_decline", request, target_id=tx.id)
     db.commit()
@@ -356,62 +386,43 @@ def fund_escrow(tx_id: int, request: Request,
     if tx.buyer_id != current_user.id:
         raise HTTPException(status_code=403, detail="Only the buyer can fund")
     if tx.status != "seller_accepted":
-        raise HTTPException(status_code=400, detail=f"Cannot fund — current status: {tx.status}")
+        raise HTTPException(status_code=400, detail=f"Cannot fund - current status: {tx.status}")
+    if tx.is_facilitated and not (tx.buyer_accepted_terms and tx.seller_accepted_terms):
+        raise HTTPException(status_code=400, detail="Both parties must accept the facilitated deal terms before funding")
 
     now = datetime.utcnow()
     if tx.payment_deadline and now > _strip_tz(tx.payment_deadline):
-        tx.status = "expired"
-        tx.closed_at = now
+        _transition(db, tx, {"status": "expired", "closed_at": now})
         db.commit()
         raise HTTPException(status_code=400, detail="Payment deadline expired")
 
-    # Calculate total buyer must pay (before gateway fee)
-    if tx.is_facilitated:
-        total = tx.amount + tx.facilitator_fee + (tx.insurance_fee or 0)
-    else:
-        total = tx.amount + (tx.insurance_fee or 0)
+    quote = _funding_quote(tx)  # B01: strict >0, bounded, nonnegative payout
+    total_with_gateway = quote["total_with_gateway"]
 
-    # Calculate gateway fee on the total, split 50/50 between buyer and seller
-    gateway_fee = _calc_gateway_fee(total)
-    buyer_gateway_share = round(gateway_fee / 2, 2)
-    seller_gateway_share = round(gateway_fee - buyer_gateway_share, 2)
-
-    # Buyer total payment includes their gateway share
-    total_with_gateway = total + buyer_gateway_share
-
-    if current_user.wallet_balance < total_with_gateway:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Insufficient wallet balance. Need ₦{total_with_gateway:,.0f}. Please deposit funds first."
-        )
-
-    # Atomic conditional update to prevent double-funding
-    rows = db.query(EscrowTransaction).filter(
-        EscrowTransaction.id == tx_id,
-        EscrowTransaction.status == "seller_accepted",
-    ).update({
+    # Claim the escrow row first (only one funding request can win) ...
+    _transition(db, tx, {
         "status": "funded", "funded_at": now,
-        "gateway_fee": gateway_fee,
-        "buyer_gateway_share": buyer_gateway_share,
-        "seller_gateway_share": seller_gateway_share,
-    }, synchronize_session=False)
-    db.flush()
-    if rows != 1:
+        "gateway_fee": quote["gateway_fee"],
+        "buyer_gateway_share": quote["buyer_gateway_share"],
+        "seller_gateway_share": quote["seller_gateway_share"],
+    }, from_status="seller_accepted")
+    # ... then debit atomically: UPDATE users SET bal = bal - x WHERE id = :id AND bal >= x (B08).
+    try:
+        debit_wallet(db, current_user.id, total_with_gateway)
+    except HTTPException:
         db.rollback()
-        raise HTTPException(status_code=409, detail="Transaction status changed concurrently")
-
-    current_user.wallet_balance -= total_with_gateway
+        raise
     db.add(WalletTx(
         user_id=current_user.id, amount=-total_with_gateway, type="escrow_hold",
         description=f"Escrow deposit for {tx.listing_title}" + (", insured" if tx.insured else "")
     ))
 
     _log_audit(db, current_user.id, "escrow_fund", request, target_id=tx.id,
-               details=f"Amount: {total_with_gateway} (gateway fee: {gateway_fee})")
+               details=f"Amount: {total_with_gateway} (gateway fee: {quote['gateway_fee']})")
     db.commit()
     db.refresh(tx)
     notify_escrow_event(_tx_dict(tx), "escrow_funded")
-    return _tx_dict(tx)
+    return _tx_dict(tx, current_user.id)
 
 
 # ── 5. FULFILL — Seller begins fulfilment ──
@@ -429,10 +440,9 @@ def seller_fulfill(tx_id: int, fulfill_in: EscrowFulfill, request: Request,
         raise HTTPException(status_code=400, detail=f"Cannot fulfill — current status: {tx.status}")
 
     now = datetime.utcnow()
-    tx.status = "seller_fulfilling"
-    tx.fulfilment_started_at = now
-    tx.logistics_provider = fulfill_in.logistics_provider
-    tx.tracking_number = fulfill_in.tracking_number
+    _transition(db, tx, {"status": "seller_fulfilling", "fulfilment_started_at": now,
+                         "logistics_provider": fulfill_in.logistics_provider,
+                         "tracking_number": fulfill_in.tracking_number})
 
     _log_audit(db, current_user.id, "escrow_fulfill", request, target_id=tx.id,
                details=fulfill_in.notes[:200] if fulfill_in.notes else "")
@@ -457,13 +467,10 @@ def mark_delivered(tx_id: int, request: Request,
         raise HTTPException(status_code=400, detail=f"Cannot deliver — current status: {tx.status}")
 
     now = datetime.utcnow()
-    tx.status = "buyer_review"
-    tx.buyer_review_started_at = now
-    tx.buyer_review_deadline = now + timedelta(days=BUYER_REVIEW_DAYS)
-
-    # Generate 6-digit release OTP for buyer
-    tx.release_otp = f"{random.randint(100000, 999999)}"
-    tx.release_otp_expiry = now + timedelta(hours=24)
+    # Generate 6-digit release OTP for buyer (CSPRNG)
+    _transition(db, tx, {"status": "buyer_review", "buyer_review_started_at": now,
+                         "buyer_review_deadline": now + timedelta(days=BUYER_REVIEW_DAYS),
+                         "release_otp": _new_otp(), "release_otp_expiry": now + timedelta(hours=24)})
 
     _log_audit(db, current_user.id, "escrow_delivered_to_buyer", request, target_id=tx.id)
     db.commit()
@@ -599,10 +606,10 @@ def raise_dispute(tx_id: int, dispute_in: EscrowDispute, request: Request,
     if tx.status not in ("buyer_review", "seller_fulfilling", "funded"):
         raise HTTPException(status_code=400, detail=f"Cannot dispute — current status: {tx.status}")
 
-    tx.status = "disputed"
-    tx.dispute_reason = sanitize_text(dispute_in.reason, max_length=1000)
-    tx.dispute_evidence = dispute_in.evidence
-    tx.dispute_initiated_by = "buyer" if current_user.id == tx.buyer_id else "seller"
+    _transition(db, tx, {"status": "disputed",
+                         "dispute_reason": sanitize_text(dispute_in.reason, max_length=1000),
+                         "dispute_evidence": dispute_in.evidence,
+                         "dispute_initiated_by": "buyer" if current_user.id == tx.buyer_id else "seller"})
 
     _log_audit(db, current_user.id, "escrow_dispute", request, target_id=tx.id,
                details=f"Initiated by {tx.dispute_initiated_by}: {dispute_in.reason[:200]}")
@@ -627,13 +634,11 @@ def cancel_escrow(tx_id: int, request: Request,
         raise HTTPException(status_code=400, detail=f"Cannot cancel — current status: {tx.status}")
 
     now = datetime.utcnow()
-
-    # If funded, refund buyer before cancelling
-    if tx.status == "funded":
+    was_funded = tx.status == "funded"
+    # Claim the state change first so a racing release/fulfil cannot also act (B08)
+    _transition(db, tx, {"status": "cancelled", "closed_at": now})
+    if was_funded:
         _refund_buyer(db, tx)
-
-    tx.status = "cancelled"
-    tx.closed_at = now
 
     _log_audit(db, current_user.id, "escrow_cancel", request, target_id=tx.id)
     db.commit()
@@ -692,10 +697,9 @@ def process_expired_deadlines(request: Request,
         EscrowTransaction.accept_deadline < now,
     ).all()
     for tx in unaccepted:
-        tx.status = "expired"
-        tx.closed_at = now
+        _transition(db, tx, {"status": "expired", "closed_at": now})
         expired_count += 1
-        _log_audit(db, 0, "escrow_auto_expire", request, target_id=tx.id,
+        _log_audit(db, None, "escrow_auto_expire", request, target_id=tx.id,
                    details="Seller did not accept in time")
 
     # Expire unfunded deals
@@ -704,10 +708,9 @@ def process_expired_deadlines(request: Request,
         EscrowTransaction.payment_deadline < now,
     ).all()
     for tx in unfunded:
-        tx.status = "expired"
-        tx.closed_at = now
+        _transition(db, tx, {"status": "expired", "closed_at": now})
         expired_count += 1
-        _log_audit(db, 0, "escrow_auto_expire", request, target_id=tx.id,
+        _log_audit(db, None, "escrow_auto_expire", request, target_id=tx.id,
                    details="Buyer did not fund in time")
 
     db.commit()
@@ -753,7 +756,7 @@ def get_transactions(current_user: User = Depends(get_current_user),
         (EscrowTransaction.seller_id == current_user.id) |
         (EscrowTransaction.facilitator_id == current_user.id)
     ).order_by(EscrowTransaction.created_at.desc()).all()
-    return {"transactions": [_tx_dict(t) for t in txs]}
+    return {"transactions": [_tx_dict(t, current_user.id) for t in txs]}
 
 
 # ── 14. GET SINGLE TRANSACTION ──
@@ -764,9 +767,9 @@ def get_transaction(tx_id: int, current_user: User = Depends(get_current_user),
     tx = db.query(EscrowTransaction).filter(EscrowTransaction.id == tx_id).first()
     if not tx:
         raise HTTPException(status_code=404, detail="Transaction not found")
-    if current_user.id not in (tx.buyer_id, tx.seller_id):
+    if current_user.id not in (tx.buyer_id, tx.seller_id, tx.facilitator_id):
         raise HTTPException(status_code=403, detail="Not authorized")
-    return _tx_dict(tx)
+    return _tx_dict(tx, current_user.id)
 
 
 # ── FACILITATOR ENDPOINTS ──
@@ -787,9 +790,9 @@ def facilitator_create_deal(deal_in: FacilitatedDealCreate, request: Request,
             status_code=403,
             detail="Identity verification required before you can facilitate deals. Submit your NIN or BVN via /auth/kyc/submit.",
         )
-    # Validate facilitator fee
-    if deal_in.facilitator_fee < 0:
-        raise HTTPException(status_code=400, detail="Facilitator fee cannot be negative")
+    # B01: re-check at the service layer (schema already enforces Decimal/bounds)
+    deal_amount = require_amount(deal_in.deal_amount, what="Deal amount")
+    facilitator_fee = require_amount(deal_in.facilitator_fee, allow_zero=True, what="Facilitator fee")
 
     # Find buyer and seller by phone
     buyer = db.query(User).filter(User.phone == deal_in.buyer_phone, User.is_active == True).first()
@@ -806,17 +809,15 @@ def facilitator_create_deal(deal_in: FacilitatedDealCreate, request: Request,
     if current_user.id in (buyer.id, seller.id):
         raise HTTPException(status_code=400, detail="Facilitator cannot be the buyer or seller")
 
-    insurance_fee = 0
-    if deal_in.insured:
-        insurance_fee = round(deal_in.deal_amount * INSURANCE_RATE, 2)
+    insurance_fee = q(deal_amount * INSURANCE_RATE) if deal_in.insured else ZERO
 
     now = datetime.utcnow()
     tx = EscrowTransaction(
         listing_id=None,  # No listing for facilitated deals
         listing_title=sanitize_text(deal_in.title, max_length=200),
         category=deal_in.category,
-        amount=deal_in.deal_amount,
-        commission=0,  # No escrow commission for facilitated deals
+        amount=deal_amount,
+        commission=ZERO,  # No escrow commission for facilitated deals
         status="created",
         buyer_id=buyer.id,
         seller_id=seller.id,
@@ -827,7 +828,7 @@ def facilitator_create_deal(deal_in: FacilitatedDealCreate, request: Request,
         is_facilitated=True,
         facilitator_id=current_user.id,
         facilitator_name=current_user.name,
-        facilitator_fee=deal_in.facilitator_fee,
+        facilitator_fee=facilitator_fee,
         accept_deadline=now + timedelta(hours=ACCEPT_DEADLINE_HOURS),
         share_token=secrets.token_urlsafe(16),
     )
@@ -946,9 +947,9 @@ def mark_shipped_legacy(tx_id: int, ship_in: EscrowShip, request: Request,
     # If tx is in old "funds_deposited" status, migrate to new flow
     tx = db.query(EscrowTransaction).filter(EscrowTransaction.id == tx_id).first()
     if tx and tx.status == "funds_deposited":
-        tx.status = "funded"
-        tx.funded_at = datetime.utcnow()
-        db.flush()
+        if tx.seller_id != current_user.id:
+            raise HTTPException(status_code=403, detail="Only the seller can mark fulfilment")
+        _transition(db, tx, {"status": "funded", "funded_at": datetime.utcnow()})
     return seller_fulfill(tx_id, fulfill_in, request, current_user, db)
 
 
@@ -961,13 +962,12 @@ def confirm_receipt_legacy(tx_id: int, request: Request,
     """
     tx = db.query(EscrowTransaction).filter(EscrowTransaction.id == tx_id).first()
     if tx and tx.status == "shipped":
+        if tx.buyer_id != current_user.id:
+            raise HTTPException(status_code=403, detail="Only the buyer can confirm receipt")
         now = datetime.utcnow()
-        tx.status = "buyer_review"
-        tx.buyer_review_started_at = now
-        tx.buyer_review_deadline = now + timedelta(days=BUYER_REVIEW_DAYS)
-        tx.release_otp = f"{random.randint(100000, 999999)}"
-        tx.release_otp_expiry = now + timedelta(hours=24)
-        db.flush()
+        _transition(db, tx, {"status": "buyer_review", "buyer_review_started_at": now,
+                             "buyer_review_deadline": now + timedelta(days=BUYER_REVIEW_DAYS),
+                             "release_otp": _new_otp(), "release_otp_expiry": now + timedelta(hours=24)})
     return buyer_approve(tx_id, request, current_user, db)
 
 
@@ -1224,15 +1224,15 @@ def get_shared_deal(share_token: str, db: Session = Depends(get_db)):
         "id": tx.id,
         "title": tx.listing_title,
         "category": tx.category,
-        "deal_amount": tx.amount,
-        "facilitator_fee": tx.facilitator_fee,
+        "deal_amount": money_out(tx.amount),
+        "facilitator_fee": money_out(tx.facilitator_fee),
         "facilitator_name": tx.facilitator_name,
         "status": tx.status,
         "is_facilitated": True,
         "buyer_name": tx.buyer_name,
         "seller_name": tx.seller_name,
-        "gateway_fee": tx.gateway_fee,
-        "insurance_fee": tx.insurance_fee,
+        "gateway_fee": money_out(tx.gateway_fee),
+        "insurance_fee": money_out(tx.insurance_fee),
         "accept_deadline": tx.accept_deadline.isoformat() if tx.accept_deadline else None,
         "payment_deadline": tx.payment_deadline.isoformat() if tx.payment_deadline else None,
         "created_at": tx.created_at.isoformat() if tx.created_at else None,

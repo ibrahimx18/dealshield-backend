@@ -29,6 +29,8 @@ from app.core.security_middleware import sanitize_text, validate_password_streng
 from app.core.kyc_crypto import encrypt_field, decrypt_field, mask_field, verify_id_number
 from app.models.models import User, Session as SessionModel, PasswordResetToken, AuditLog
 from app.core.notifications import notify_new_user, notify_kyc_submitted, notification_service
+from decimal import Decimal
+from app.core.money import money_out
 
 router = APIRouter()
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
@@ -72,7 +74,7 @@ def _profile_dict(user: User) -> dict:
         "name": user.name,
         "phone": user.phone,
         "email": user.email,
-        "wallet_balance": user.wallet_balance,
+        "wallet_balance": money_out(user.wallet_balance),
         "nin_verified": user.nin_verified,
         "phone_verified": user.phone_verified,
         "email_verified": user.email_verified,
@@ -155,7 +157,7 @@ def register(user_in: UserCreate, request: Request, db: Session = Depends(get_db
         phone=user_in.phone,
         email=user_in.email.lower().strip(),
         hashed_password=get_password_hash(user_in.password),
-        wallet_balance=500000.0 if SAFEPAY_TEST_MODE else 0.0,
+        wallet_balance=Decimal("500000.00") if SAFEPAY_TEST_MODE else Decimal("0.00"),
         phone_verified=True,
         email_verified=False,
         password_changed_at=datetime.now(timezone.utc),

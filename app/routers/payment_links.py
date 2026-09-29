@@ -8,6 +8,7 @@ from app.schemas.schemas import PaymentLinkCreate, PaymentLinkOut, PaymentLinkLi
 from app.models.models import PaymentLink, User
 from app.routers.auth import get_current_user
 from app.core.security_middleware import sanitize_text
+from app.core.money import money_out, require_amount
 
 router = APIRouter()
 
@@ -20,7 +21,7 @@ def _link_dict(l: PaymentLink, seller_name: str = None) -> dict:
         "seller_name": seller_name,
         "title": l.title,
         "description": l.description or "",
-        "amount": l.amount,
+        "amount": money_out(l.amount),
         "category": l.category,
         "status": l.status,
         "created_at": l.created_at.isoformat() if l.created_at else None,
@@ -35,15 +36,14 @@ def _gen_code() -> str:
 
 @router.post("", response_model=PaymentLinkOut)
 def create_payment_link(link_in: PaymentLinkCreate, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    if link_in.amount <= 0:
-        raise HTTPException(status_code=400, detail="Amount must be positive")
+    amount = require_amount(link_in.amount)
 
     link = PaymentLink(
         link_code=_gen_code(),
         seller_id=current_user.id,
         title=sanitize_text(link_in.title, max_length=200),
         description=sanitize_text(link_in.description, max_length=500),
-        amount=link_in.amount,
+        amount=amount,
         category=link_in.category,
     )
     db.add(link)

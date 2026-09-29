@@ -3,12 +3,15 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from datetime import datetime
 from typing import Optional, List, Literal
+from decimal import Decimal
 from pydantic import BaseModel
 
 from app.dependencies import get_db
 from app.models.models import EscrowTransaction, User, WalletTx, AdminAuditLog
 from app.routers.auth import get_current_user
 from app.routers.escrow import CANCELLATION_FEE
+from app.core.wallet import credit_wallet
+from app.core.money import q, to_decimal, ZERO, money_out
 from app.core.security_middleware import sanitize_text
 from app.core.notifications import notify_escrow_event
 
@@ -17,7 +20,7 @@ router = APIRouter()
 
 class DisputeResolveRequest(BaseModel):
     decision: Literal["release_to_seller", "refund_to_buyer", "split"]
-    buyer_split_percent: Optional[float] = None  # Required if decision == 'split' (e.g., 50.0 for 50/50)
+    buyer_split_percent: Optional[Decimal] = None  # Required if decision == 'split' (e.g., 50.0 for 50/50)
     reason: str  # Mandatory explanation for resolution
 
 
@@ -59,9 +62,9 @@ def list_disputed_transactions(
             "id": tx.id,
             "listing_title": tx.listing_title,
             "category": tx.category,
-            "amount": tx.amount,
-            "commission": tx.commission,
-            "insurance_fee": tx.insurance_fee or 0,
+            "amount": money_out(tx.amount),
+            "commission": money_out(tx.commission),
+            "insurance_fee": money_out(tx.insurance_fee),
             "status": tx.status,
             "buyer_id": tx.buyer_id,
             "buyer_name": tx.buyer_name or (buyer.name if buyer else ""),
@@ -165,26 +168,26 @@ def resolve_dispute(
         db.rollback()
         raise HTTPException(status_code=409, detail="Transaction status changed concurrently; aborting dispute resolution.")
 
-    total_pool = tx.amount + (tx.facilitator_fee if tx.is_facilitated else 0) + (tx.insurance_fee or 0)
+    total_pool = q(to_decimal(tx.amount) + (to_decimal(tx.facilitator_fee) if tx.is_facilitated else ZERO) + to_decimal(tx.insurance_fee))
     details_str = f"Decision: {req_decision}. Reason: {req_reason}."
 
     if req_decision == "release_to_seller":
         if tx.is_facilitated:
             # Facilitated deal: seller gets full amount, facilitator gets 90% of fee
-            seller.wallet_balance += tx.amount
+            credit_wallet(db, seller.id, tx.amount)
             db.add(WalletTx(
                 user_id=seller.id, amount=tx.amount, type="escrow_release",
                 description=f"Admin dispute resolution payout for {tx.listing_title} (Tx #{tx.id}, facilitated)"
             ))
             # Pay facilitator 90% of their fee
             if tx.facilitator_fee and tx.facilitator_fee > 0 and tx.facilitator_id:
-                dealshield_cut = round(tx.facilitator_fee * 0.10, 2)
-                facilitator_payout = round(tx.facilitator_fee * 0.90, 2)
+                dealshield_cut = q(to_decimal(tx.facilitator_fee) * Decimal("0.10"))
+                facilitator_payout = q(to_decimal(tx.facilitator_fee) * Decimal("0.90"))
                 tx.dealshield_cut = dealshield_cut
                 tx.facilitator_payout = facilitator_payout
                 facilitator = db.query(User).filter(User.id == tx.facilitator_id).first()
                 if facilitator:
-                    facilitator.wallet_balance += facilitator_payout
+                    credit_wallet(db, facilitator.id, facilitator_payout)
                     db.add(WalletTx(
                         user_id=facilitator.id, amount=facilitator_payout, type="facilitator_payout",
                         description=f"Admin dispute resolution facilitator payout for {tx.listing_title} (Tx #{tx.id})"
@@ -192,8 +195,8 @@ def resolve_dispute(
             details_str += f" Seller credited ₦{tx.amount:,.2f} (facilitated)."
         else:
             # Normal deal: seller gets amount minus commission
-            seller_payout = tx.amount - tx.commission
-            seller.wallet_balance += seller_payout
+            seller_payout = q(to_decimal(tx.amount) - to_decimal(tx.commission))
+            credit_wallet(db, seller.id, seller_payout)
             db.add(WalletTx(
                 user_id=seller.id, amount=seller_payout, type="escrow_release",
                 description=f"Admin dispute resolution payout for {tx.listing_title} (Tx #{tx.id})"
@@ -212,8 +215,8 @@ def resolve_dispute(
         else:
             tx.cancellation_fee = buyer_refund
             tx.dealshield_cut = (tx.dealshield_cut or 0) + buyer_refund
-            buyer_refund = 0.0
-        buyer.wallet_balance += buyer_refund
+            buyer_refund = ZERO
+        credit_wallet(db, buyer.id, buyer_refund)
         db.add(WalletTx(
             user_id=buyer.id, amount=buyer_refund, type="escrow_refund",
             description=f"Admin dispute resolution refund for {tx.listing_title} (Tx #{tx.id}, ₦{tx.cancellation_fee:,.0f} cancellation fee deducted)"
@@ -225,20 +228,20 @@ def resolve_dispute(
             db.rollback()
             raise HTTPException(status_code=400, detail="buyer_split_percent must be between 0 and 100 for split decision.")
 
-        buyer_pct = req.buyer_split_percent / 100.0
-        seller_pct = 1.0 - buyer_pct
+        buyer_pct = to_decimal(req.buyer_split_percent) / Decimal(100)
+        seller_pct = Decimal(1) - buyer_pct
 
         # For facilitated deals: split the deal amount between buyer and seller,
         # and reduce facilitator fee proportionally (seller's portion goes to facilitator)
         if tx.is_facilitated:
             deal_amount = tx.amount
-            facilitator_fee = tx.facilitator_fee or 0
-            facilitator_payout = 0.0  # default
+            facilitator_fee = to_decimal(tx.facilitator_fee)
+            facilitator_payout = ZERO  # default
 
             # Buyer gets their share of the deal amount back
-            buyer_share = round(deal_amount * buyer_pct, 2)
+            buyer_share = q(deal_amount * buyer_pct)
             # Seller gets their share of the deal amount
-            seller_share = round(deal_amount * seller_pct, 2)
+            seller_share = q(deal_amount * seller_pct)
 
             # Deduct ₦5,000 cancellation fee from buyer's share
             if buyer_share > CANCELLATION_FEE:
@@ -248,32 +251,32 @@ def resolve_dispute(
             elif buyer_share > 0:
                 tx.cancellation_fee = buyer_share
                 tx.dealshield_cut = (tx.dealshield_cut or 0) + buyer_share
-                buyer_share = 0.0
+                buyer_share = ZERO
 
             # Facilitator fee is reduced proportionally — facilitator gets
             # seller_pct of their fee (since seller is the one fulfilling)
-            facilitator_fee_portion = round(facilitator_fee * seller_pct, 2)
+            facilitator_fee_portion = q(facilitator_fee * seller_pct)
             if facilitator_fee_portion > 0 and tx.facilitator_id:
-                dealshield_cut = round(facilitator_fee_portion * 0.10, 2)
-                facilitator_payout = round(facilitator_fee_portion * 0.90, 2)
+                dealshield_cut = q(facilitator_fee_portion * Decimal("0.10"))
+                facilitator_payout = q(facilitator_fee_portion * Decimal("0.90"))
                 tx.dealshield_cut = dealshield_cut
                 tx.facilitator_payout = facilitator_payout
                 facilitator = db.query(User).filter(User.id == tx.facilitator_id).first()
                 if facilitator:
-                    facilitator.wallet_balance += facilitator_payout
+                    credit_wallet(db, facilitator.id, facilitator_payout)
                     db.add(WalletTx(
                         user_id=facilitator.id, amount=facilitator_payout, type="facilitator_payout",
                         description=f"Admin split facilitator payout ({seller_pct*100:.1f}% of fee) for {tx.listing_title} (Tx #{tx.id})"
                     ))
 
             if buyer_share > 0:
-                buyer.wallet_balance += buyer_share
+                credit_wallet(db, buyer.id, buyer_share)
                 db.add(WalletTx(
                     user_id=buyer.id, amount=buyer_share, type="escrow_refund",
                     description=f"Admin split refund ({req.buyer_split_percent}%) for {tx.listing_title} (Tx #{tx.id})"
                 ))
             if seller_share > 0:
-                seller.wallet_balance += seller_share
+                credit_wallet(db, seller.id, seller_share)
                 db.add(WalletTx(
                     user_id=seller.id, amount=seller_share, type="escrow_release",
                     description=f"Admin split payout ({seller_pct*100:.1f}%) for {tx.listing_title} (Tx #{tx.id})"
@@ -282,8 +285,8 @@ def resolve_dispute(
 
         else:
             # Normal deal: split the total pool
-            buyer_share = round(total_pool * buyer_pct, 2)
-            seller_share = round(total_pool * seller_pct, 2)
+            buyer_share = q(total_pool * buyer_pct)
+            seller_share = q(total_pool * seller_pct)
 
             # Deduct ₦5,000 cancellation fee from buyer's share
             if buyer_share > CANCELLATION_FEE:
@@ -293,16 +296,16 @@ def resolve_dispute(
             elif buyer_share > 0:
                 tx.cancellation_fee = buyer_share
                 tx.dealshield_cut = (tx.dealshield_cut or 0) + buyer_share
-                buyer_share = 0.0
+                buyer_share = ZERO
 
             if buyer_share > 0:
-                buyer.wallet_balance += buyer_share
+                credit_wallet(db, buyer.id, buyer_share)
                 db.add(WalletTx(
                     user_id=buyer.id, amount=buyer_share, type="escrow_refund",
                     description=f"Admin dispute split refund ({req.buyer_split_percent}%) for {tx.listing_title} (Tx #{tx.id})"
                 ))
             if seller_share > 0:
-                seller.wallet_balance += seller_share
+                credit_wallet(db, seller.id, seller_share)
                 db.add(WalletTx(
                     user_id=seller.id, amount=seller_share, type="escrow_release",
                     description=f"Admin dispute split payout ({100 - req.buyer_split_percent:.1f}%) for {tx.listing_title} (Tx #{tx.id})"
@@ -325,7 +328,7 @@ def resolve_dispute(
     tx_dict = {
         "id": tx.id,
         "listing_title": tx.listing_title,
-        "amount": tx.amount,
+        "amount": money_out(tx.amount),
         "status": tx.status,
         "buyer_id": tx.buyer_id,
         "seller_id": tx.seller_id

@@ -7,6 +7,7 @@ from app.models.models import Listing, User
 from app.routers.auth import get_current_user
 from app.core.notifications import notify_listing_event
 from app.core.security_middleware import sanitize_text
+from app.core.money import money_out, require_amount
 
 router = APIRouter()
 
@@ -16,7 +17,7 @@ def _listing_dict(l: Listing) -> dict:
         "category": l.category,
         "title": l.title,
         "description": l.description or "",
-        "price": l.price,
+        "price": money_out(l.price),
         "location": l.location or "",
         "seller_name": l.seller_name or "",
         "seller_rating": l.seller_rating or "5.0",
@@ -28,7 +29,7 @@ def _listing_dict(l: Listing) -> dict:
 
 @router.get("", response_model=ListingListResponse)
 def list_listings(category: Optional[str] = Query(None), search: Optional[str] = Query(None), db: Session = Depends(get_db)):
-    q = db.query(Listing)
+    q = db.query(Listing).filter(Listing.is_active == True)
     if category and category != "undefined":
         q = q.filter(Listing.category == category)
     if search:
@@ -39,7 +40,7 @@ def list_listings(category: Optional[str] = Query(None), search: Optional[str] =
 
 @router.get("/{listing_id}", response_model=ListingOut)
 def get_listing(listing_id: int, db: Session = Depends(get_db)):
-    l = db.query(Listing).filter(Listing.id == listing_id).first()
+    l = db.query(Listing).filter(Listing.id == listing_id, Listing.is_active == True).first()
     if not l:
         raise HTTPException(status_code=404, detail="Listing not found")
     return _listing_dict(l)
@@ -56,13 +57,13 @@ def create_listing(listing_in: ListingCreate, current_user: User = Depends(get_c
         category=listing_in.category,
         title=sanitize_text(listing_in.title, max_length=200),
         description=sanitize_text(listing_in.description, max_length=5000),
-        price=listing_in.price,
+        price=require_amount(listing_in.price, what="Price"),  # B01 service-layer re-check
         location=sanitize_text(listing_in.location, max_length=200),
         insured=listing_in.insured,
         seller_id=current_user.id,
         seller_name=current_user.name,
         seller_rating=str(current_user.rating),
-        verified=True,  # auto-verify for now
+        verified=False,  # B02: never auto-verify
     )
     db.add(listing)
     db.commit()
