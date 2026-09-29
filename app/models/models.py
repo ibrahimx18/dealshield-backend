@@ -205,6 +205,9 @@ class PaymentReference(Base):
     amount = Column(Money, nullable=False)
     provider = Column(String, nullable=False, default="")
     status = Column(String, nullable=False, default="pending")  # pending -> consumed
+    # B04: when set, this reference is the funding intent for exactly this escrow.
+    escrow_tx_id = Column(Integer, ForeignKey("escrow_transactions.id"), nullable=True, index=True)
+    currency = Column(String(8), nullable=False, default="NGN")
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)  # NEW
 

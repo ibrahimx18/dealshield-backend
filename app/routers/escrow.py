@@ -39,7 +39,9 @@ from app.schemas.schemas import (
     EscrowFulfill, FacilitatedDealCreate, FacilitatorAcceptTerms, VirtualAccountOut,
     ReleaseOTPRequest,
 )
-from app.models.models import EscrowTransaction, User, Listing, WalletTx, AuditLog, VirtualAccount
+from app.models.models import (EscrowTransaction, User, Listing, WalletTx, AuditLog, VirtualAccount,
+                               PaymentReference, PaymentWebhookEvent, WebhookQuarantine)
+from sqlalchemy.exc import IntegrityError
 from app.routers.auth import get_current_user, _update_badge
 from app.core.config import settings
 from app.core.notifications import notify_escrow_event
@@ -1099,111 +1101,206 @@ def get_virtual_account(tx_id: int,
     return _va_dict(va)
 
 
+@router.post("/{tx_id}/payment-intent")
+def create_payment_intent(tx_id: int, request: Request,
+                          current_user: User = Depends(get_current_user),
+                          db: Session = Depends(get_db)):
+    """B04: create a provider reference bound to this escrow with the exact
+    server-computed amount. The webhook only funds an escrow via such an intent.
+    Returns 503 when the provider is not configured."""
+    if not settings.PAYSTACK_SECRET_KEY:
+        raise HTTPException(status_code=503, detail="External payment is unavailable: provider not configured")
+    tx = db.query(EscrowTransaction).filter(EscrowTransaction.id == tx_id).first()
+    if not tx:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    if tx.buyer_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Only the buyer can pay")
+    if tx.status not in FUNDABLE_STATES:
+        raise HTTPException(status_code=400, detail=f"Cannot pay - current status: {tx.status}")
+    if tx.is_facilitated and not (tx.buyer_accepted_terms and tx.seller_accepted_terms):
+        raise HTTPException(status_code=400, detail="Both parties must accept the facilitated deal terms before funding")
+    quote = _funding_quote(tx)
+    reference = f"DSX_{tx.id}_{secrets.token_urlsafe(12)}"
+    db.add(PaymentReference(reference=reference, user_id=current_user.id, amount=quote["total_with_gateway"],
+                            provider=WEBHOOK_PROVIDER, status="pending", escrow_tx_id=tx.id, currency="NGN"))
+    _log_audit(db, current_user.id, "escrow_payment_intent", request, target_id=tx.id,
+               details=f"ref {reference}, NGN {quote['total_with_gateway']}")
+    db.commit()
+    return {"reference": reference, "amount": money_out(quote["total_with_gateway"]),
+            "amount_kobo": int(quote["total_with_gateway"] * 100), "currency": "NGN",
+            "provider": WEBHOOK_PROVIDER}
+
+
+# B04: only this event type means "money was received". transfer.success is an
+# OUTGOING payout and dedicated_account.assigned is account provisioning.
+FUNDING_EVENT_TYPES = {"charge.success"}
+WEBHOOK_PROVIDER = "paystack"
+FUNDABLE_STATES = ("seller_accepted", "payment_pending")
+
+
+def _quarantine(db: Session, *, event_id, reference, event_type, tx_id, expected, received,
+                currency, reason: str, body: bytes, event_row: PaymentWebhookEvent | None):
+    db.add(WebhookQuarantine(
+        provider=WEBHOOK_PROVIDER, event_id=event_id, reference=reference, event_type=event_type,
+        escrow_tx_id=tx_id, expected_amount=expected, received_amount=received, currency=currency,
+        reason=reason, payload_sha256=hashlib.sha256(body).hexdigest(),
+    ))
+    if event_row is not None:
+        event_row.status = "quarantined"
+        event_row.reason = reason
+    _log_audit(db, None, "payment_webhook_quarantined", None, target_id=tx_id,
+               details=f"{reason} (ref={reference}, event={event_id})")
+    db.commit()
+    # HTTP 200 so the provider stops retrying; no funds moved.
+    return {"status": "quarantined", "reason": reason}
+
+
 @router.post("/webhook/payment")
 async def escrow_payment_webhook(request: Request,
                                   x_paystack_signature: str = Header(None, alias="x-paystack-signature"),
                                   db: Session = Depends(get_db)):
-    """Webhook endpoint for payment provider (Paystack) to notify us when
-    a virtual account receives funds. Validates the webhook signature,
-    matches the payment to an escrow transaction by account number, and
-    marks the escrow as funded.
+    """Provider (Paystack) funding webhook - B04.
 
-    This is a placeholder — in production, integrate with Paystack's
-    dedicated NUBAN virtual account API for real signature verification.
+    1. Raw-body HMAC-SHA512 with the provider secret is mandatory.
+    2. Only `charge.success` with data.status == "success" is a funding event.
+    3. (provider, event id) and (provider, reference) are unique -> replays are no-ops.
+    4. The reference must be a pending funding intent bound to exactly one escrow.
+    5. Amount (kobo) and currency must equal the server-computed expected total exactly.
+    Any mismatch -> quarantine row + audit log, HTTP 200, no money movement.
     """
     body = await request.body()
-    body_text = body.decode("utf-8") if body else ""
 
-    # Validate webhook signature
-    secret = settings.PAYSTACK_SECRET_KEY or settings.WEBHOOK_SECRET
+    secret = settings.PAYSTACK_SECRET_KEY
     if not secret:
         raise HTTPException(status_code=503, detail="Payment provider not configured")
-
-    computed_signature = hmac.new(
-        secret.encode("utf-8"),
-        body,
-        hashlib.sha512,
-    ).hexdigest()
-
-    if not x_paystack_signature or not hmac.compare_digest(computed_signature, x_paystack_signature):
+    computed = hmac.new(secret.encode("utf-8"), body, hashlib.sha512).hexdigest()
+    if not x_paystack_signature or not hmac.compare_digest(computed, x_paystack_signature.strip().lower()):
         raise HTTPException(status_code=401, detail="Invalid webhook signature")
 
-    # Parse webhook payload
     try:
-        payload = json.loads(body_text) if body_text else {}
-    except json.JSONDecodeError:
+        payload = json.loads(body.decode("utf-8")) if body else {}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+    if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Invalid JSON payload")
 
-    event = payload.get("event", "")
-    data = payload.get("data", {})
+    event_type = str(payload.get("event") or "")
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    if event_type not in FUNDING_EVENT_TYPES or data.get("status") != "success":
+        return {"status": "ignored", "event": event_type}
 
-    # Only process successful transfer/charge events
-    if event not in ("transfer.success", "charge.success", "dedicated_account.assigned"):
-        return {"status": "ignored", "event": event}
+    event_id = str(data.get("id") or "").strip()
+    reference = str(data.get("reference") or "").strip()
+    currency = str(data.get("currency") or "").strip().upper()
+    if not event_id or not reference:
+        return _quarantine(db, event_id=event_id or None, reference=reference or None, event_type=event_type,
+                           tx_id=None, expected=None, received=None, currency=currency,
+                           reason="missing event id or reference", body=body, event_row=None)
 
-    # Match by account number
-    account_number = data.get("account_number") or data.get("dedicated_account", {}).get("account_number")
-    if not account_number:
-        return {"status": "ignored", "reason": "no account number in payload"}
+    try:
+        raw_amount = data.get("amount")
+        if isinstance(raw_amount, bool) or not isinstance(raw_amount, (int, str)):
+            raise ValueError
+        received = (Decimal(str(raw_amount)) / 100).quantize(Decimal("0.01"))
+        if not received.is_finite() or received <= 0 or received > MAX_AMOUNT:
+            raise ValueError
+    except Exception:
+        received = None
 
-    va = db.query(VirtualAccount).filter(
-        VirtualAccount.account_number == str(account_number),
+    # Idempotency: claim the event id first. A replay hits the unique constraint.
+    event_row = PaymentWebhookEvent(provider=WEBHOOK_PROVIDER, event_id=event_id, reference=reference,
+                                    event_type=event_type, amount=received, currency=currency,
+                                    status="received")
+    try:
+        with db.begin_nested():
+            db.add(event_row)
+            db.flush()
+    except IntegrityError:
+        db.rollback()
+        return {"status": "duplicate", "event_id": event_id}
+
+    if received is None:
+        return _quarantine(db, event_id=event_id, reference=reference, event_type=event_type, tx_id=None,
+                           expected=None, received=None, currency=currency,
+                           reason="invalid amount", body=body, event_row=event_row)
+
+    intent = db.query(PaymentReference).filter(
+        PaymentReference.reference == reference, PaymentReference.provider == WEBHOOK_PROVIDER,
     ).first()
-    if not va:
-        return {"status": "ignored", "reason": "account not found"}
+    if intent is None or intent.escrow_tx_id is None:
+        return _quarantine(db, event_id=event_id, reference=reference, event_type=event_type, tx_id=None,
+                           expected=None, received=received, currency=currency,
+                           reason="reference does not map to an escrow funding intent", body=body,
+                           event_row=event_row)
+    tx = db.query(EscrowTransaction).filter(EscrowTransaction.id == intent.escrow_tx_id).first()
+    event_row.escrow_tx_id = intent.escrow_tx_id
+    if tx is None or tx.buyer_id != intent.user_id:
+        return _quarantine(db, event_id=event_id, reference=reference, event_type=event_type,
+                           tx_id=intent.escrow_tx_id, expected=to_decimal(intent.amount), received=received,
+                           currency=currency, reason="escrow missing or buyer mismatch", body=body,
+                           event_row=event_row)
+    if intent.status != "pending":
+        return _quarantine(db, event_id=event_id, reference=reference, event_type=event_type, tx_id=tx.id,
+                           expected=to_decimal(intent.amount), received=received, currency=currency,
+                           reason=f"funding intent already {intent.status}", body=body, event_row=event_row)
+    if tx.status not in FUNDABLE_STATES or (
+            tx.is_facilitated and not (tx.buyer_accepted_terms and tx.seller_accepted_terms)):
+        return _quarantine(db, event_id=event_id, reference=reference, event_type=event_type, tx_id=tx.id,
+                           expected=to_decimal(intent.amount), received=received, currency=currency,
+                           reason=f"escrow not fundable in status {tx.status}", body=body, event_row=event_row)
 
-    if va.status != "active":
-        return {"status": "ignored", "reason": f"account status is {va.status}"}
+    try:
+        quote = _funding_quote(tx)
+    except HTTPException as exc:
+        return _quarantine(db, event_id=event_id, reference=reference, event_type=event_type, tx_id=tx.id,
+                           expected=None, received=received, currency=currency,
+                           reason=f"invalid escrow amounts: {exc.detail}", body=body, event_row=event_row)
+    expected = quote["total_with_gateway"]
+    if currency != (intent.currency or "NGN") or currency != "NGN":
+        return _quarantine(db, event_id=event_id, reference=reference, event_type=event_type, tx_id=tx.id,
+                           expected=expected, received=received, currency=currency,
+                           reason="currency mismatch", body=body, event_row=event_row)
+    if received != expected or to_decimal(intent.amount) != expected:
+        return _quarantine(db, event_id=event_id, reference=reference, event_type=event_type, tx_id=tx.id,
+                           expected=expected, received=received, currency=currency,
+                           reason="amount mismatch", body=body, event_row=event_row)
 
-    # Check expiry
+    # Reconciled: consume the intent and fund the escrow atomically (conditional updates).
     now = datetime.utcnow()
-    if va.expires_at and now > va.expires_at:
-        va.status = "expired"
-        db.commit()
-        return {"status": "ignored", "reason": "account expired"}
-
-    # Mark virtual account as paid
-    va.status = "paid"
-    va.updated_at = now
-
-    # Fund the escrow transaction (atomic conditional update to prevent double-funding)
-    tx = db.query(EscrowTransaction).filter(EscrowTransaction.id == va.escrow_tx_id).first()
-    if not tx:
-        return {"status": "error", "reason": "escrow transaction not found"}
-
-    if tx.status in ("payment_pending", "seller_accepted", "created"):
-        rows = db.query(EscrowTransaction).filter(
-            EscrowTransaction.id == tx.id,
-            EscrowTransaction.status.in_(["payment_pending", "seller_accepted", "created"]),
-        ).update({"status": "funded", "funded_at": now}, synchronize_session=False)
-        db.flush()
-        if rows != 1:
+    claimed = db.query(PaymentReference).filter(
+        PaymentReference.id == intent.id, PaymentReference.status == "pending",
+    ).update({"status": "consumed"}, synchronize_session=False)
+    rows = db.query(EscrowTransaction).filter(
+        EscrowTransaction.id == tx.id, EscrowTransaction.status.in_(FUNDABLE_STATES),
+    ).update({"status": "funded", "funded_at": now, "gateway_fee": quote["gateway_fee"],
+              "buyer_gateway_share": quote["buyer_gateway_share"],
+              "seller_gateway_share": quote["seller_gateway_share"]}, synchronize_session=False)
+    if claimed != 1 or rows != 1:
+        db.rollback()
+        # Record the lost race in a fresh transaction; still no money moved.
+        db.add(PaymentWebhookEvent(provider=WEBHOOK_PROVIDER, event_id=event_id, reference=reference,
+                                   event_type=event_type, amount=received, currency=currency,
+                                   escrow_tx_id=tx.id, status="quarantined",
+                                   reason="concurrent state change"))
+        try:
+            db.commit()
+        except IntegrityError:
             db.rollback()
-            return {"status": "error", "reason": "concurrent status change"}
+        return {"status": "quarantined", "reason": "concurrent state change"}
 
-        # Record wallet transaction for audit trail (no balance deduction — external payment)
-        db.add(WalletTx(
-            user_id=tx.buyer_id,
-            amount=va.expected_amount,
-            type="escrow_fund_external",
-            description=f"Virtual account payment for {tx.listing_title} (Acct: {va.account_number})",
-        ))
-
-        # Audit log (no user context in webhook)
-        db.add(AuditLog(
-            actor_id=0,
-            action="virtual_account_payment",
-            target_type="escrow_transaction",
-            target_id=tx.id,
-            details=f"Virtual account {va.account_number} funded with ₦{va.expected_amount:,.0f}",
-        ))
-
-        db.commit()
-        db.refresh(tx)
-        notify_escrow_event(_tx_dict(tx), "escrow_funded")
-        return {"status": "success", "escrow_id": tx.id, "new_status": "funded"}
-
-    return {"status": "ignored", "reason": f"escrow status is {tx.status}"}
+    db.query(VirtualAccount).filter(VirtualAccount.escrow_tx_id == tx.id, VirtualAccount.status == "active") \
+        .update({"status": "paid", "updated_at": now}, synchronize_session=False)
+    event_row.status = "applied"
+    db.add(WalletTx(
+        user_id=tx.buyer_id, amount=received, type="escrow_fund_external",
+        description=f"External payment for {tx.listing_title} (ref {reference})",
+    ))
+    _log_audit(db, None, "escrow_funded_external", None, target_id=tx.id,
+               details=f"Provider event {event_id}, ref {reference}, NGN {received}")
+    db.commit()
+    db.refresh(tx)
+    notify_escrow_event(_tx_dict(tx), "escrow_funded")
+    return {"status": "success", "escrow_id": tx.id, "new_status": "funded"}
 
 
 # ── DEAL SHARE LINK — Get deal by share token (public, no auth) ──
