@@ -676,7 +676,7 @@ def verify_2fa(payload: Verify2FARequest, request: Request, current_user: User =
     _log_audit(db, current_user.id, "2fa_enabled", request)
     db.commit()
 
-    return {"detail": "2FA enabled successfully. Other sessions have been logged out."}
+    return {"detail": "2FA enabled successfully. All sessions have been logged out; please log in again with 2FA."}
 
 
 @router.post("/2fa/disable")

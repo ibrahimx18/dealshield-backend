@@ -1109,14 +1109,20 @@ async def escrow_payment_webhook(request: Request,
     except Exception:
         received = None
 
-    # Idempotency: claim the event id first. A replay hits the unique constraint.
+    # Idempotency: an already-seen event id or reference is a no-op (replay).
+    seen = db.query(PaymentWebhookEvent.id).filter(
+        PaymentWebhookEvent.provider == WEBHOOK_PROVIDER,
+        (PaymentWebhookEvent.event_id == event_id) | (PaymentWebhookEvent.reference == reference),
+    ).first()
+    if seen:
+        return {"status": "duplicate", "event_id": event_id}
+    # Claim the event; a concurrent replay loses on the UNIQUE constraints.
     event_row = PaymentWebhookEvent(provider=WEBHOOK_PROVIDER, event_id=event_id, reference=reference,
                                     event_type=event_type, amount=received, currency=currency,
                                     status="received")
     try:
-        with db.begin_nested():
-            db.add(event_row)
-            db.flush()
+        db.add(event_row)
+        db.flush()
     except IntegrityError:
         db.rollback()
         return {"status": "duplicate", "event_id": event_id}

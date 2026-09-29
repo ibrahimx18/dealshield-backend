@@ -58,6 +58,7 @@ def require_amount(value: Any, *, allow_zero: bool = False, what: str = "Amount"
     return d.quantize(CENT)
 
 
-def money_out(value: Any) -> Decimal:
-    """Serialise for API responses: always a 2dp Decimal (JSON string '15000.00')."""
-    return q(value or 0)
+def money_out(value: Any) -> str:
+    """Serialise for API responses: always a 2dp string, e.g. "15000.00".
+    (A str survives FastAPI's jsonable_encoder, which would turn Decimal into float.)"""
+    return f"{q(value or 0):.2f}"

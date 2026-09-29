@@ -9,7 +9,7 @@ from pydantic import BaseModel
 from app.dependencies import get_db
 from app.models.models import EscrowTransaction, User, WalletTx, AdminAuditLog
 from app.routers.auth import get_current_user
-from app.routers.escrow import CANCELLATION_FEE
+from app.routers.escrow import CANCELLATION_FEE, _transition
 from app.core.wallet import credit_wallet
 from app.core.money import q, to_decimal, ZERO, money_out
 from app.core.security_middleware import sanitize_text
@@ -92,7 +92,7 @@ def start_investigation(
     if tx.status != "disputed":
         raise HTTPException(status_code=400, detail=f"Transaction is in '{tx.status}', not 'disputed'")
 
-    tx.status = "under_investigation"
+    _transition(db, tx, {"status": "under_investigation"}, from_status="disputed")
     db.commit()
     return {"status": "success", "message": f"Transaction #{tx_id} moved to investigation", "new_status": tx.status}
 
