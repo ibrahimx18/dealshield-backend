@@ -4,6 +4,7 @@ Endpoints for n8n workflows and external integrations.
 Protected by a shared secret key.
 """
 import os
+import hmac
 from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException, Header
 from sqlalchemy.orm import Session
@@ -21,7 +22,9 @@ INTEGRATION_SECRET = os.getenv("SAFEPAY_WEBHOOK_SECRET", "")
 
 def verify_secret(x_safepay_secret: str = Header(None)):
     """Verify the integration secret for n8n endpoints."""
-    if x_safepay_secret != INTEGRATION_SECRET:
+    # B17: an empty configured secret never matches (fail closed); constant-time compare.
+    if not INTEGRATION_SECRET or not x_safepay_secret or \
+            not hmac.compare_digest(x_safepay_secret.encode(), INTEGRATION_SECRET.encode()):
         raise HTTPException(status_code=403, detail="Invalid integration secret")
     return True
 

@@ -13,6 +13,7 @@ Set API keys via environment variables:
 """
 
 import os, secrets
+from decimal import Decimal, InvalidOperation
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 import requests
@@ -20,6 +21,8 @@ from app.dependencies import get_db
 from app.schemas.schemas import InitializePayment, VerifyPayment, PaymentResponse
 from app.models.models import User, WalletTx, PaymentReference
 from app.routers.auth import get_current_user
+from app.core.wallet import credit_wallet
+from app.core.money import money_out, to_decimal
 
 router = APIRouter()
 
@@ -32,8 +35,6 @@ FLUTTERWAVE_BASE = "https://api.flutterwave.com/v3"
 @router.post("/initialize", response_model=PaymentResponse)
 def initialize_payment(pay_in: InitializePayment, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Initialize a payment — returns authorization URL for the user to pay."""
-    if pay_in.amount <= 0:
-        raise HTTPException(status_code=400, detail="Amount must be positive")
 
     # Amount in kobo for Paystack, or naira for Flutterwave
     reference = f"SFP_{secrets.token_urlsafe(8)}"
@@ -58,7 +59,8 @@ def initialize_payment(pay_in: InitializePayment, current_user: User = Depends(g
         }
         payload = {
             "email": pay_in.email,
-            "amount": int(pay_in.amount * 100),  # kobo
+            "amount": int(pay_in.amount * 100),  # kobo, exact (Decimal)
+            "currency": "NGN",
             "reference": reference,
             "callback_url": os.getenv("SAFEPAY_PAYMENT_CALLBACK", "http://localhost:8000/payments/callback"),
             "metadata": {"user_id": current_user.id, "purpose": "wallet_funding"},
@@ -72,8 +74,8 @@ def initialize_payment(pay_in: InitializePayment, current_user: User = Depends(g
                 reference=reference,
                 status="initialized",
             )
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"Paystack init failed: {e}")
+        except Exception:
+            raise HTTPException(status_code=502, detail="Paystack init failed")
 
     elif pay_in.provider == "flutterwave":
         if not FLUTTERWAVE_SECRET:
@@ -99,14 +101,15 @@ def initialize_payment(pay_in: InitializePayment, current_user: User = Depends(g
                 reference=reference,
                 status="initialized",
             )
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"Flutterwave init failed: {e}")
+        except Exception:
+            raise HTTPException(status_code=502, detail="Flutterwave init failed")
 
     else:
         raise HTTPException(status_code=400, detail="Provider must be 'paystack' or 'flutterwave'")
 
 
-def _claim_payment_reference(db: Session, reference: str, current_user: User) -> PaymentReference:
+def _claim_payment_reference(db: Session, reference: str, current_user: User,
+                             provider: str, payment: dict) -> PaymentReference:
     """Audit C3: enforce that a payment reference belongs to the calling user,
     is still 'pending', and atomically flip it to 'consumed' before any wallet
     credit happens. Returns the claimed PaymentReference row.
@@ -123,6 +126,24 @@ def _claim_payment_reference(db: Session, reference: str, current_user: User) ->
         raise HTTPException(status_code=404, detail="Payment reference not found for this user")
     if pay_ref.status != "pending":
         raise HTTPException(status_code=409, detail="Payment reference already consumed")
+    if pay_ref.escrow_tx_id is not None:
+        raise HTTPException(status_code=400, detail="This reference funds an escrow and is settled by webhook only")
+
+    # B10: the provider response must match the stored payment intent exactly.
+    reference_field = "reference" if provider == "paystack" else "tx_ref"
+    if pay_ref.provider != provider or str(payment.get(reference_field) or "") != reference:
+        raise HTTPException(status_code=400, detail="Payment provider/reference does not match payment intent")
+    if str(payment.get("currency") or "").upper() != "NGN":
+        raise HTTPException(status_code=400, detail="Payment currency does not match payment intent")
+    try:
+        amount = Decimal(str(payment.get("amount")))
+        if provider == "paystack":
+            amount = amount / 100
+        valid = amount.is_finite() and amount > 0 and amount == to_decimal(pay_ref.amount)
+    except (InvalidOperation, ValueError, TypeError):
+        valid = False
+    if not valid:
+        raise HTTPException(status_code=400, detail="Payment amount does not match payment intent")
 
     # Atomic conditional update — only one concurrent /verify call can win.
     rows = db.query(PaymentReference).filter(
@@ -152,9 +173,9 @@ def verify_payment(verify_in: VerifyPayment, current_user: User = Depends(get_cu
             resp.raise_for_status()
             data = resp.json()
             if data["data"]["status"] == "success":
-                _claim_payment_reference(db, verify_in.reference, current_user)
-                amount = data["data"]["amount"] / 100  # kobo → naira
-                current_user.wallet_balance += amount
+                pay_ref = _claim_payment_reference(db, verify_in.reference, current_user, "paystack", data["data"])
+                amount = to_decimal(pay_ref.amount)
+                new_balance = credit_wallet(db, current_user.id, amount)
                 db.add(WalletTx(
                     user_id=current_user.id,
                     amount=amount,
@@ -162,24 +183,26 @@ def verify_payment(verify_in: VerifyPayment, current_user: User = Depends(get_cu
                     description=f"Wallet funding via Paystack ({verify_in.reference})",
                 ))
                 db.commit()
-                return {"status": "success", "amount": amount, "new_balance": current_user.wallet_balance}
+                return {"status": "success", "amount": money_out(amount), "new_balance": money_out(new_balance)}
             else:
                 return {"status": "failed", "detail": data["data"]["status"]}
         except HTTPException:
             raise
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"Paystack verify failed: {e}")
+        except Exception:
+            db.rollback()
+            raise HTTPException(status_code=502, detail="Paystack verify failed")
 
     elif verify_in.provider == "flutterwave":
         headers = {"Authorization": f"Bearer {FLUTTERWAVE_SECRET}"}
         try:
-            resp = requests.get(f"{FLUTTERWAVE_BASE}/transactions/{verify_in.reference}/verify", headers=headers, timeout=15)
+            resp = requests.get(f"{FLUTTERWAVE_BASE}/transactions/verify_by_reference",
+                                params={"tx_ref": verify_in.reference}, headers=headers, timeout=15)
             resp.raise_for_status()
             data = resp.json()
             if data["data"]["status"] == "successful":
-                _claim_payment_reference(db, verify_in.reference, current_user)
-                amount = float(data["data"]["amount"])
-                current_user.wallet_balance += amount
+                pay_ref = _claim_payment_reference(db, verify_in.reference, current_user, "flutterwave", data["data"])
+                amount = to_decimal(pay_ref.amount)
+                new_balance = credit_wallet(db, current_user.id, amount)
                 db.add(WalletTx(
                     user_id=current_user.id,
                     amount=amount,
@@ -187,13 +210,14 @@ def verify_payment(verify_in: VerifyPayment, current_user: User = Depends(get_cu
                     description=f"Wallet funding via Flutterwave ({verify_in.reference})",
                 ))
                 db.commit()
-                return {"status": "success", "amount": amount, "new_balance": current_user.wallet_balance}
+                return {"status": "success", "amount": money_out(amount), "new_balance": money_out(new_balance)}
             else:
                 return {"status": "failed", "detail": data["data"]["status"]}
         except HTTPException:
             raise
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"Flutterwave verify failed: {e}")
+        except Exception:
+            db.rollback()
+            raise HTTPException(status_code=502, detail="Flutterwave verify failed")
 
     else:
         raise HTTPException(status_code=400, detail="Provider must be 'paystack' or 'flutterwave'")
