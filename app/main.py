@@ -73,6 +73,21 @@ def validate_required_secrets():
 
 validate_required_secrets()
 
+
+def _truthy(name: str) -> bool:
+    return os.getenv(name, "false").strip().lower() in ("1", "true", "yes")
+
+
+def validate_runtime_flags():
+    """B11: test/demo behaviour can never be enabled in production."""
+    if os.getenv("ENVIRONMENT", "development").strip().lower() == "production":
+        bad = [n for n in ("DEALSHIELD_SEED_DEMO", "SAFEPAY_TEST_MODE") if _truthy(n)]
+        if bad:
+            raise RuntimeError(f"Refusing to start: {', '.join(bad)} must not be enabled when ENVIRONMENT=production")
+
+
+validate_runtime_flags()
+
 Base.metadata.create_all(bind=engine)
 
 # ── Seed demo data ──
@@ -80,30 +95,37 @@ from app.models.models import User, Listing, MarketPrice
 from app.core.security import get_password_hash
 
 def seed():
+    """B11: demo data only with explicit DEALSHIELD_SEED_DEMO=true, never in production.
+    The demo password comes from DEALSHIELD_DEMO_PASSWORD (no hardcoded default)."""
+    if not _truthy("DEALSHIELD_SEED_DEMO"):
+        return
+    if os.getenv("ENVIRONMENT", "development").strip().lower() == "production":
+        raise RuntimeError("Refusing to seed demo data when ENVIRONMENT=production")
+    demo_password = os.getenv("DEALSHIELD_DEMO_PASSWORD", "")
+    if len(demo_password) < 12:
+        raise RuntimeError("DEALSHIELD_SEED_DEMO=true requires DEALSHIELD_DEMO_PASSWORD (12+ chars)")
     db = SessionLocal()
     try:
         if db.query(User).first() is None:
             seller = User(
                 name="Ibrahim Seller", phone="08012345678", email="seller@dealshield.ng",
-                hashed_password=get_password_hash("demo1234"),
-                wallet_balance=500000, nin_verified=True, phone_verified=True, id_verified=True,
-                total_deals=12, rating=4.8,
+                hashed_password=get_password_hash(demo_password),
+                wallet_balance=500000, total_deals=12, rating=4.8,
             )
             buyer = User(
                 name="Geralt Buyer", phone="08098765432", email="geralt@dealshield.ng",
-                hashed_password=get_password_hash("demo1234"),
-                wallet_balance=500000, nin_verified=True, phone_verified=True, id_verified=True,
-                total_deals=3, rating=5.0,
+                hashed_password=get_password_hash(demo_password),
+                wallet_balance=500000, total_deals=3, rating=5.0,
             )
             db.add_all([seller, buyer])
             db.flush()
 
             listings = [
-                Listing(category="cars", title="Toyota Corolla 2015", description="Well maintained, 50,000km, AC working perfectly. Lagos registered.", price=4500000, location="Lekki, Lagos", seller_id=seller.id, seller_name=seller.name, seller_rating="4.8", verified=True),
-                Listing(category="gold", title="24K Gold Bar — 100g", description="Pure 24K gold bar, certified. Direct from refinery.", price=8500000, location="Kano", seller_id=seller.id, seller_name=seller.name, seller_rating="4.8", verified=True),
-                Listing(category="dollars", title="$5,000 USD", description="Transfer at bank rate. Clean funds.", price=4000000, location="Abuja", seller_id=seller.id, seller_name=seller.name, seller_rating="4.8", verified=True),
-                Listing(category="land", title="500sqm Land — Lekki Scheme", description="C of O, dry land, fenced, ready to build.", price=15000000, location="Lekki, Lagos", seller_id=seller.id, seller_name=seller.name, seller_rating="4.8", verified=True),
-                Listing(category="oil", title="10,000 Litres AGO (Diesel)", description="Bulk diesel at depot price. Quality tested.", price=4200000, location="Apapa, Lagos", seller_id=seller.id, seller_name=seller.name, seller_rating="4.8", verified=True),
+                Listing(category="cars", title="Toyota Corolla 2015", description="Well maintained, 50,000km, AC working perfectly. Lagos registered.", price=4500000, location="Lekki, Lagos", seller_id=seller.id, seller_name=seller.name, seller_rating="4.8", verified=False),
+                Listing(category="gold", title="24K Gold Bar — 100g", description="Pure 24K gold bar, certified. Direct from refinery.", price=8500000, location="Kano", seller_id=seller.id, seller_name=seller.name, seller_rating="4.8", verified=False),
+                Listing(category="dollars", title="$5,000 USD", description="Transfer at bank rate. Clean funds.", price=4000000, location="Abuja", seller_id=seller.id, seller_name=seller.name, seller_rating="4.8", verified=False),
+                Listing(category="land", title="500sqm Land — Lekki Scheme", description="C of O, dry land, fenced, ready to build.", price=15000000, location="Lekki, Lagos", seller_id=seller.id, seller_name=seller.name, seller_rating="4.8", verified=False),
+                Listing(category="oil", title="10,000 Litres AGO (Diesel)", description="Bulk diesel at depot price. Quality tested.", price=4200000, location="Apapa, Lagos", seller_id=seller.id, seller_name=seller.name, seller_rating="4.8", verified=False),
             ]
             db.add_all(listings)
 
