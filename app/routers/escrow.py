@@ -11,7 +11,6 @@ Flow:
   Exit paths: CANCELLED (before funding), EXPIRED (deadlines), CLOSED (terminal)
 """
 import json
-import random  # only used by the legacy account generator (removed in B03 commit)
 import hashlib
 import hmac
 import secrets
@@ -48,6 +47,7 @@ from app.core.notifications import notify_escrow_event
 from app.core.security_middleware import sanitize_text
 from app.core.money import q, require_amount, money_out, to_decimal, ZERO, MAX_AMOUNT
 from app.core.wallet import debit_wallet, credit_wallet
+from app.core.payment_provider import get_account_provider, UNSUPPORTED_DETAIL
 
 router = APIRouter()
 
@@ -975,20 +975,7 @@ def confirm_receipt_legacy(tx_id: int, request: Request,
 
 # ── VIRTUAL ACCOUNT ENDPOINTS ──
 
-def _generate_account_number() -> str:
-    """Generate a 10-digit NUBAN-format account number.
 
-    NUBAN format: 9-digit serial + 1 checksum digit.
-    The checksum is computed using the standard CBN NUBAN algorithm:
-    for a 9-digit serial N = n1 n2 ... n9, checksum = (3*n1 + 7*n2 + 3*n3 + 3*n4 + 7*n5 + 3*n6 + 3*n7 + 7*n8 + 3*n9) mod 10, then 10 - result mod 10.
-    """
-    serial = random.randint(100000000, 999999999)  # 9-digit serial
-    digits = [int(d) for d in str(serial)]
-    # NUBAN check digit algorithm (CBN standard)
-    weights = [3, 7, 3, 3, 7, 3, 3, 7, 3]
-    check_sum = sum(w * d for w, d in zip(weights, digits))
-    check_digit = (10 - (check_sum % 10)) % 10
-    return f"{serial}{check_digit}"
 
 
 def _va_dict(va: VirtualAccount) -> dict:
@@ -1001,7 +988,7 @@ def _va_dict(va: VirtualAccount) -> dict:
         "account_name": va.account_name,
         "provider": va.provider,
         "status": va.status,
-        "expected_amount": va.expected_amount,
+        "expected_amount": money_out(va.expected_amount),
         "expires_at": va.expires_at.isoformat() if va.expires_at else None,
         "created_at": va.created_at.isoformat() if va.created_at else None,
         "updated_at": va.updated_at.isoformat() if va.updated_at else None,
@@ -1012,123 +999,38 @@ def _va_dict(va: VirtualAccount) -> dict:
 def generate_virtual_account(tx_id: int, request: Request,
                              current_user: User = Depends(get_current_user),
                              db: Session = Depends(get_db)):
-    """Generate a dedicated virtual account for an escrow transaction.
-    The buyer can transfer the exact expected amount directly to this account.
-    The account auto-expires when the payment deadline passes.
-    """
+    """B03: a dedicated account may only come from a real provider. None is
+    integrated, so this returns 503 and never invents an account number or
+    changes the escrow state."""
     tx = db.query(EscrowTransaction).filter(EscrowTransaction.id == tx_id).first()
     if not tx:
         raise HTTPException(status_code=404, detail="Transaction not found")
     if tx.buyer_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Only the buyer can generate a virtual account")
-    if tx.status not in ("seller_accepted", "payment_pending", "created"):
-        raise HTTPException(status_code=400, detail=f"Cannot generate account — current status: {tx.status}")
-
-    # Check if a virtual account already exists for this transaction
-    existing = db.query(VirtualAccount).filter(
-        VirtualAccount.escrow_tx_id == tx_id,
-        VirtualAccount.status == "active",
-    ).first()
-    if existing:
-        # Return existing account
-        return _va_dict(existing)
-
-    # Calculate total buyer must pay
-    if tx.is_facilitated:
-        total = tx.amount + tx.facilitator_fee + (tx.insurance_fee or 0)
-    else:
-        total = tx.amount + (tx.insurance_fee or 0)
-
-    # Generate unique account number
-    for _ in range(10):
-        acct_no = _generate_account_number()
-        if not db.query(VirtualAccount).filter(VirtualAccount.account_number == acct_no).first():
-            break
-    else:
-        raise HTTPException(status_code=500, detail="Failed to generate unique account number")
-
-    # Set expiry to payment deadline
-    expires_at = tx.payment_deadline
-
-    va = VirtualAccount(
-        escrow_tx_id=tx_id,
-        account_number=acct_no,
-        bank_name="DealShield MFB",
-        bank_code="999",
-        account_name=f"DEALSHIELD/{current_user.name}/{tx_id}",
-        provider=settings.PAYMENT_PROVIDER,
-        status="active",
-        expected_amount=total,
-        expires_at=expires_at,
-    )
-    db.add(va)
-
-    # If the escrow is in 'created' or 'seller_accepted', set it to 'payment_pending'
-    if tx.status in ("created", "seller_accepted"):
-        tx.status = "payment_pending"
-
-    _log_audit(db, current_user.id, "virtual_account_generate", request,
-               target_id=tx_id, details=f"Account: {acct_no}, Amount: {total}")
-    db.commit()
-    db.refresh(va)
-    return _va_dict(va)
+        raise HTTPException(status_code=403, detail="Only the buyer can request a payment account")
+    provider = get_account_provider()
+    if provider is None:
+        raise HTTPException(status_code=503, detail=UNSUPPORTED_DETAIL)
+    raise HTTPException(status_code=503, detail=UNSUPPORTED_DETAIL)  # pragma: no cover - wire provider here
 
 
 @router.get("/{tx_id}/account", response_model=VirtualAccountOut)
 def get_virtual_account(tx_id: int,
                         current_user: User = Depends(get_current_user),
                         db: Session = Depends(get_db)):
-    """Get the virtual account details for a transaction."""
+    """B03: legacy locally-generated account numbers are never shown (they are not real accounts)."""
     tx = db.query(EscrowTransaction).filter(EscrowTransaction.id == tx_id).first()
     if not tx:
         raise HTTPException(status_code=404, detail="Transaction not found")
-    if current_user.id not in (tx.buyer_id, tx.seller_id):
+    if current_user.id not in (tx.buyer_id, tx.seller_id, tx.facilitator_id):
         raise HTTPException(status_code=403, detail="Not authorized")
-
+    if get_account_provider() is None:
+        raise HTTPException(status_code=503, detail=UNSUPPORTED_DETAIL)
     va = db.query(VirtualAccount).filter(
-        VirtualAccount.escrow_tx_id == tx_id,
+        VirtualAccount.escrow_tx_id == tx_id, VirtualAccount.provider != "dealshield",
     ).order_by(VirtualAccount.created_at.desc()).first()
     if not va:
-        raise HTTPException(status_code=404, detail="No virtual account for this transaction")
-
-    # Auto-expire if payment deadline has passed
-    now = datetime.utcnow()
-    if va.status == "active" and va.expires_at and now > va.expires_at:
-        va.status = "expired"
-        db.commit()
-        db.refresh(va)
-
-    return _va_dict(va)
-
-
-@router.post("/{tx_id}/payment-intent")
-def create_payment_intent(tx_id: int, request: Request,
-                          current_user: User = Depends(get_current_user),
-                          db: Session = Depends(get_db)):
-    """B04: create a provider reference bound to this escrow with the exact
-    server-computed amount. The webhook only funds an escrow via such an intent.
-    Returns 503 when the provider is not configured."""
-    if not settings.PAYSTACK_SECRET_KEY:
-        raise HTTPException(status_code=503, detail="External payment is unavailable: provider not configured")
-    tx = db.query(EscrowTransaction).filter(EscrowTransaction.id == tx_id).first()
-    if not tx:
-        raise HTTPException(status_code=404, detail="Transaction not found")
-    if tx.buyer_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Only the buyer can pay")
-    if tx.status not in FUNDABLE_STATES:
-        raise HTTPException(status_code=400, detail=f"Cannot pay - current status: {tx.status}")
-    if tx.is_facilitated and not (tx.buyer_accepted_terms and tx.seller_accepted_terms):
-        raise HTTPException(status_code=400, detail="Both parties must accept the facilitated deal terms before funding")
-    quote = _funding_quote(tx)
-    reference = f"DSX_{tx.id}_{secrets.token_urlsafe(12)}"
-    db.add(PaymentReference(reference=reference, user_id=current_user.id, amount=quote["total_with_gateway"],
-                            provider=WEBHOOK_PROVIDER, status="pending", escrow_tx_id=tx.id, currency="NGN"))
-    _log_audit(db, current_user.id, "escrow_payment_intent", request, target_id=tx.id,
-               details=f"ref {reference}, NGN {quote['total_with_gateway']}")
-    db.commit()
-    return {"reference": reference, "amount": money_out(quote["total_with_gateway"]),
-            "amount_kobo": int(quote["total_with_gateway"] * 100), "currency": "NGN",
-            "provider": WEBHOOK_PROVIDER}
+        raise HTTPException(status_code=404, detail="No payment account for this transaction")
+    return _va_dict(va)  # read-only: no expiry writes on GET
 
 
 # B04: only this event type means "money was received". transfer.success is an
