@@ -50,16 +50,16 @@ class HTTPSRedirectMiddleware(BaseHTTPMiddleware):
 # ── Rate Limiting Middleware (checklist item #11) ──
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
-    """Simple in-memory rate limiter.
-    - Login/register: 5 requests per 60 seconds per IP
-    - All other endpoints: 60 requests per 60 seconds per IP
-    """
+    """In-memory request limits: login/register 5/60s; 2FA 3/30m; others 60/60s."""
 
     def __init__(self, app):
         super().__init__(app)
         self.login_attempts: dict[str, deque] = defaultdict(deque)
+        self.two_factor_attempts: dict[str, deque] = defaultdict(deque)
         self.general_attempts: dict[str, deque] = defaultdict(deque)
         self.login_limit = 5
+        self.two_factor_limit = 3
+        self.two_factor_window = 30 * 60
         self.general_limit = 60
         self.window = 60  # seconds
 
@@ -68,14 +68,21 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         path = request.url.path
         now = time.time()
 
-        # Stricter rate limit for auth endpoints
-        if path in ("/auth/login", "/auth/register"):
-            attempts = self.login_attempts[client_ip]
-            while attempts and attempts[0] < now - self.window:
+        # Strict per-IP buckets for primary and 2FA login challenges.
+        if path in ("/auth/login", "/auth/register", "/auth/login/2fa"):
+            is_two_factor = path == "/auth/login/2fa"
+            attempts = self.two_factor_attempts[client_ip] if is_two_factor else self.login_attempts[client_ip]
+            window = self.two_factor_window if is_two_factor else self.window
+            while attempts and attempts[0] < now - window:
                 attempts.popleft()
-            if len(attempts) >= self.login_limit:
+            two_factor_limit = self.two_factor_limit if is_two_factor else self.login_limit
+            if len(attempts) >= two_factor_limit:
                 return Response(
-                    content='{"detail":"Too many login attempts. Please wait 60 seconds."}',
+                    content=(
+                        '{"detail":"Too many 2FA attempts. Please wait 30 minutes."}'
+                        if is_two_factor else
+                        '{"detail":"Too many authentication attempts. Please wait 60 seconds."}'
+                    ),
                     status_code=429,
                     media_type="application/json",
                 )
@@ -97,6 +104,8 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             cutoff = now - self.window
             self.general_attempts = {ip: dq for ip, dq in self.general_attempts.items() if dq and dq[-1] >= cutoff}
             self.login_attempts = {ip: dq for ip, dq in self.login_attempts.items() if dq and dq[-1] >= cutoff}
+            two_factor_cutoff = now - self.two_factor_window
+            self.two_factor_attempts = {ip: dq for ip, dq in self.two_factor_attempts.items() if dq and dq[-1] >= two_factor_cutoff}
 
         return await call_next(request)
 

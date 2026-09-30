@@ -20,8 +20,9 @@ PostgreSQL unless noted, and are idempotent (IF NOT EXISTS) except 010 and 012.
 | 11 | 010_money_numeric_constraints.sql | **new** - run the pre-flight SELECTs first |
 | 12 | 011_webhook_idempotency.sql | **new** |
 | 13 | 012_sessions_kyc_status.sql | **new** - revokes all sessions (everyone re-logs in), resets KYC to pending review |
+| 14 | 013_otp_attempt_limits.sql | **new** - persistent failed release-OTP counter + 15-minute lock after five guesses |
 
-New migrations start at 013. Never reuse a number.
+New migrations start at 014. Never reuse a number.
 
-Before running 010-012 on production: take a backup, rehearse on a restored copy,
+Before running 010-013 on production: take a backup, rehearse on a restored copy,
 and run each file inside its own transaction (they contain BEGIN/COMMIT).
