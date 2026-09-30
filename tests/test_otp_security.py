@@ -69,6 +69,7 @@ def test_release_otp_locks_after_five_wrong_attempts_and_persists():
                    for _ in range(5)]
         sixth = client.post(f"/escrow/{tx_id}/release-otp", json={"otp": "000000"}, headers=headers)
     assert [r.status_code for r in results] == [400, 400, 400, 400, 429]
+    assert results[-1].headers.get("Retry-After") == "900"
     assert sixth.status_code == 429
     db = SessionLocal()
     try:
