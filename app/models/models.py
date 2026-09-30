@@ -163,6 +163,8 @@ class EscrowTransaction(Base):
     # ── Release OTP (buyer enters code to release funds) ──
     release_otp = Column(String, default="")              # 6-digit OTP generated when buyer_review starts
     release_otp_expiry = Column(DateTime, nullable=True)  # OTP validity window
+    release_otp_attempts = Column(Integer, default=0, nullable=False)
+    release_otp_locked_until = Column(DateTime(timezone=True), nullable=True)
     # ── Shareable deal link ──
     share_token = Column(String, default="")              # unique token for shareable deal link
 

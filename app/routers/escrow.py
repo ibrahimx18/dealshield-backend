@@ -60,6 +60,8 @@ CANCELLATION_FEE = 5000.0
 ACCEPT_DEADLINE_HOURS = 48       # Seller must accept within 48h
 PAYMENT_DEADLINE_HOURS = 24      # Buyer must fund within 24h after seller accepts
 BUYER_REVIEW_DAYS = 1             # Auto-release after 24 hours if buyer is silent
+RELEASE_OTP_MAX_ATTEMPTS = 5
+RELEASE_OTP_LOCK_MINUTES = 15
 
 
 def _calc_gateway_fee(amount: float) -> float:
@@ -462,8 +464,10 @@ def mark_delivered(tx_id: int, request: Request,
     tx.buyer_review_deadline = now + timedelta(days=BUYER_REVIEW_DAYS)
 
     # Generate 6-digit release OTP for buyer
-    tx.release_otp = f"{random.randint(100000, 999999)}"
+    tx.release_otp = _new_otp()
     tx.release_otp_expiry = now + timedelta(hours=24)
+    tx.release_otp_attempts = 0
+    tx.release_otp_locked_until = None
 
     _log_audit(db, current_user.id, "escrow_delivered_to_buyer", request, target_id=tx.id)
     db.commit()
@@ -522,7 +526,8 @@ def release_with_otp(tx_id: int, otp_in: ReleaseOTPRequest, request: Request,
     """Buyer submits the 6-digit OTP to release funds to seller.
     Alternative to manual /approve — provides OTP-based verification.
     """
-    tx = db.query(EscrowTransaction).filter(EscrowTransaction.id == tx_id).first()
+    # Serialize OTP checks so parallel guesses cannot race the attempt counter.
+    tx = db.query(EscrowTransaction).filter(EscrowTransaction.id == tx_id).with_for_update().first()
     if not tx:
         raise HTTPException(status_code=404, detail="Transaction not found")
     if tx.buyer_id != current_user.id:
@@ -534,13 +539,28 @@ def release_with_otp(tx_id: int, otp_in: ReleaseOTPRequest, request: Request,
     if tx.release_otp_expiry and datetime.utcnow() > _strip_tz(tx.release_otp_expiry):
         raise HTTPException(status_code=400, detail="OTP has expired. Contact support or use manual approval.")
 
+    now = datetime.utcnow()
+    locked_until = _strip_tz(tx.release_otp_locked_until)
+    if locked_until and now < locked_until:
+        retry_after = max(1, int((locked_until - now).total_seconds()))
+        raise HTTPException(status_code=429, detail="Release code temporarily locked after failed attempts.",
+                            headers={"Retry-After": str(retry_after)})
+
     if otp_in.otp.strip() != tx.release_otp:
+        tx.release_otp_attempts = (tx.release_otp_attempts or 0) + 1
+        if tx.release_otp_attempts >= RELEASE_OTP_MAX_ATTEMPTS:
+            tx.release_otp_locked_until = now + timedelta(minutes=RELEASE_OTP_LOCK_MINUTES)
+        db.commit()
+        if tx.release_otp_locked_until:
+            raise HTTPException(status_code=429, detail="Release code temporarily locked after failed attempts.",
+                                headers={"Retry-After": str(RELEASE_OTP_LOCK_MINUTES * 60)})
         raise HTTPException(status_code=400, detail="Invalid OTP code")
 
-    now = datetime.utcnow()
-    # Clear OTP after use
+    # Clear OTP and its throttling state after successful use.
     tx.release_otp = ""
     tx.release_otp_expiry = None
+    tx.release_otp_attempts = 0
+    tx.release_otp_locked_until = None
 
     rows = db.query(EscrowTransaction).filter(
         EscrowTransaction.id == tx_id,
