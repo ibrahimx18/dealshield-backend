@@ -100,14 +100,19 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             attempts.append(now)
 
         # Cleanup old IPs occasionally
+        # N01: rebuild as defaultdict(deque) - a plain dict made every later
+        # unseen IP raise KeyError (HTTP 500 for new visitors).
         if len(self.general_attempts) > 1000:
-            cutoff = now - self.window
-            self.general_attempts = {ip: dq for ip, dq in self.general_attempts.items() if dq and dq[-1] >= cutoff}
-            self.login_attempts = {ip: dq for ip, dq in self.login_attempts.items() if dq and dq[-1] >= cutoff}
-            two_factor_cutoff = now - self.two_factor_window
-            self.two_factor_attempts = {ip: dq for ip, dq in self.two_factor_attempts.items() if dq and dq[-1] >= two_factor_cutoff}
+            self._cleanup(now)
 
         return await call_next(request)
+
+    def _cleanup(self, now: float):
+        cutoff = now - self.window
+        self.general_attempts = defaultdict(deque, {ip: dq for ip, dq in self.general_attempts.items() if dq and dq[-1] >= cutoff})
+        self.login_attempts = defaultdict(deque, {ip: dq for ip, dq in self.login_attempts.items() if dq and dq[-1] >= cutoff})
+        two_factor_cutoff = now - self.two_factor_window
+        self.two_factor_attempts = defaultdict(deque, {ip: dq for ip, dq in self.two_factor_attempts.items() if dq and dq[-1] >= two_factor_cutoff})
 
 
 # ── Input Sanitizer (checklist item #14, #15) ──
