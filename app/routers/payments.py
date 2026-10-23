@@ -12,7 +12,8 @@ Set API keys via environment variables:
 - FLUTTERWAVE_SECRET_KEY
 """
 
-import os, secrets
+import os, re, secrets
+from urllib.parse import quote
 from decimal import Decimal, InvalidOperation
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
@@ -30,6 +31,17 @@ PAYSTACK_SECRET = os.getenv("PAYSTACK_SECRET_KEY", "")
 FLUTTERWAVE_SECRET = os.getenv("FLUTTERWAVE_SECRET_KEY", "")
 PAYSTACK_BASE = "https://api.paystack.co"
 FLUTTERWAVE_BASE = "https://api.flutterwave.com/v3"
+
+# N06: our references look like SFP_<token_urlsafe(8)>. Anything else is rejected
+# BEFORE a provider call, so user input can never change the provider URL path.
+REFERENCE_RE = re.compile(r"^SFP_[A-Za-z0-9_-]{6,32}$")
+
+
+def _validate_reference(reference: str) -> str:
+    reference = (reference or "").strip()
+    if not REFERENCE_RE.fullmatch(reference):
+        raise HTTPException(status_code=400, detail="Invalid payment reference")
+    return reference
 
 
 @router.post("/initialize", response_model=PaymentResponse)
@@ -165,11 +177,17 @@ def verify_payment(verify_in: VerifyPayment, current_user: User = Depends(get_cu
     Audit C3: the reference must belong to the calling user and be 'pending';
     it is atomically marked 'consumed' BEFORE crediting the wallet, so a
     replayed/duplicate verify call cannot credit the wallet twice.
+    N06: the reference is validated against REFERENCE_RE and URL-encoded before
+    any provider call; provider fields are never echoed back.
     """
+    if verify_in.provider not in ("paystack", "flutterwave"):
+        raise HTTPException(status_code=400, detail="Provider must be 'paystack' or 'flutterwave'")
+    reference = _validate_reference(verify_in.reference)
+    verify_in.reference = reference
     if verify_in.provider == "paystack":
         headers = {"Authorization": f"Bearer {PAYSTACK_SECRET}"}
         try:
-            resp = requests.get(f"{PAYSTACK_BASE}/transaction/verify/{verify_in.reference}", headers=headers, timeout=15)
+            resp = requests.get(f"{PAYSTACK_BASE}/transaction/verify/{quote(reference, safe='')}", headers=headers, timeout=15)
             resp.raise_for_status()
             data = resp.json()
             if data["data"]["status"] == "success":
@@ -185,7 +203,7 @@ def verify_payment(verify_in: VerifyPayment, current_user: User = Depends(get_cu
                 db.commit()
                 return {"status": "success", "amount": money_out(amount), "new_balance": money_out(new_balance)}
             else:
-                return {"status": "failed", "detail": data["data"]["status"]}
+                return {"status": "failed", "detail": "Payment not successful"}
         except HTTPException:
             raise
         except Exception:
@@ -212,7 +230,7 @@ def verify_payment(verify_in: VerifyPayment, current_user: User = Depends(get_cu
                 db.commit()
                 return {"status": "success", "amount": money_out(amount), "new_balance": money_out(new_balance)}
             else:
-                return {"status": "failed", "detail": data["data"]["status"]}
+                return {"status": "failed", "detail": "Payment not successful"}
         except HTTPException:
             raise
         except Exception:
