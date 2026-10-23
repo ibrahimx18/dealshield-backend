@@ -599,12 +599,22 @@ def release_with_otp(tx_id: int, otp_in: ReleaseOTPRequest, request: Request,
 
 # ── 7c. GET RELEASE OTP — Buyer retrieves their OTP (for demo/testing) ──
 
+def _release_otp_demo_enabled() -> bool:
+    import os
+    env = os.getenv("ENVIRONMENT", "development").strip().lower()
+    test_mode = os.getenv("SAFEPAY_TEST_MODE", "false").strip().lower() in ("1", "true", "yes")
+    return env != "production" and test_mode
+
+
 @router.get("/{tx_id}/release-otp")
 def get_release_otp(tx_id: int, current_user: User = Depends(get_current_user),
                     db: Session = Depends(get_db)):
-    """Buyer retrieves their release OTP. In production, this would be sent via SMS/email.
-    For now, returns it directly (demo mode).
+    """Buyer retrieves their release OTP - DEMO ONLY (N11).
+    Available only when ENVIRONMENT != production AND SAFEPAY_TEST_MODE is true;
+    otherwise 404 (the code reaches the buyer by SMS/email, never via this route).
     """
+    if not _release_otp_demo_enabled():
+        raise HTTPException(status_code=404, detail="Not found")
     tx = db.query(EscrowTransaction).filter(EscrowTransaction.id == tx_id).first()
     if not tx:
         raise HTTPException(status_code=404, detail="Transaction not found")
