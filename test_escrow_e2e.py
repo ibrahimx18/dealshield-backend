@@ -5,7 +5,16 @@ Flow: register 3 users → fund via DB → create listing → create escrow → 
 """
 import requests, time, re, sys, psycopg2
 
-BASE = "http://localhost:8001"
+# N14: connection comes ONLY from the environment (never a file or a literal).
+# Point E2E_DATABASE_URL (or DATABASE_URL) at a disposable local database; if
+# neither is set, the script stops cleanly instead of guessing.
+import os  # noqa: E402
+_db_url = os.getenv("E2E_DATABASE_URL") or os.getenv("DATABASE_URL", "")
+if not _db_url.startswith("postgresql"):
+    print("[SKIP] E2E_DATABASE_URL / DATABASE_URL not set to a PostgreSQL URL - skipping e2e run")
+    sys.exit(0)
+
+BASE = __import__("os").getenv("E2E_BASE_URL", "http://localhost:8001")
 S = requests.Session()
 results = []
 deal_otp = None
@@ -50,9 +59,7 @@ for role in ["buyer", "seller", "facilitator"]:
         sys.exit(1)
 
 # ── 3. Fund wallets via DB (update users.wallet_balance) ─────────────────
-url_re = re.search(r'DATABASE_URL=postgresql://(\w+):(.*)@(\w+):(\d+)/(\w+)', open('.env').read())
-db_user, db_pwd, db_host, db_port, db_name = url_re.groups()
-conn = psycopg2.connect(user=db_user, password=db_pwd, host=db_host, port=db_port, dbname=db_name)
+conn = psycopg2.connect(_db_url.replace("postgresql+psycopg2://", "postgresql://"))
 cur = conn.cursor()
 
 buyer_id = users["buyer"]["user_id"]
