@@ -63,16 +63,18 @@ def make_buyer_and_transaction():
     return ids
 
 
-def test_2fa_login_is_rate_limited_to_three_per_30m_per_ip():
+def test_2fa_login_per_ip_secondary_limit_counts_failures():
+    # N02: per-IP is now the looser secondary check (20 FAILED attempts / 30 min);
+    # the primary control is the per-user DB counter (tests/test_n02_2fa_lockout.py).
     ip = "198.51.100.44"
     with TestClient(app, client=(ip, 43210)) as client:
         codes = []
-        for _ in range(3):
+        for _ in range(20):
             response = client.post("/auth/login/2fa", json={"temp_token": "invalid", "totp_code": "000000"})
             codes.append(response.status_code)
-        fourth = client.post("/auth/login/2fa", json={"temp_token": "invalid", "totp_code": "000000"})
-    assert codes == [401] * 3
-    assert fourth.status_code == 429
+        last = client.post("/auth/login/2fa", json={"temp_token": "invalid", "totp_code": "000000"})
+    assert codes == [401] * 20
+    assert last.status_code == 429
 
 
 def test_release_otp_locks_after_five_wrong_attempts_and_persists():

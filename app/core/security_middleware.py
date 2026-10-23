@@ -50,7 +50,14 @@ class HTTPSRedirectMiddleware(BaseHTTPMiddleware):
 # ── Rate Limiting Middleware (checklist item #11) ──
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
-    """In-memory request limits: login/register 5/60s; 2FA 3/30m; others 60/60s."""
+    """In-memory request limits: login/register 5/60s; others 60/60s.
+
+    2FA (N02): the primary control is the DB-backed per-user counter in
+    auth.login_2fa (5 failures -> 15 min lock). This per-IP bucket is a looser
+    secondary check that counts FAILED 2FA attempts only (20 per 30 min), so
+    successful logins never lock anyone out. The client IP comes from
+    app.core.client_ip.get_client_ip (proxy headers only when TRUSTED_PROXY=1).
+    """
 
     def __init__(self, app):
         super().__init__(app)
@@ -58,31 +65,42 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.two_factor_attempts: dict[str, deque] = defaultdict(deque)
         self.general_attempts: dict[str, deque] = defaultdict(deque)
         self.login_limit = 5
-        self.two_factor_limit = 3
+        self.two_factor_limit = 20  # failed attempts per IP per window (secondary)
         self.two_factor_window = 30 * 60
         self.general_limit = 60
         self.window = 60  # seconds
 
     async def dispatch(self, request: Request, call_next):
-        client_ip = request.client.host if request.client else "unknown"
+        from app.core.client_ip import get_client_ip
+        client_ip = get_client_ip(request)
         path = request.url.path
         now = time.time()
 
-        # Strict per-IP buckets for primary and 2FA login challenges.
-        if path in ("/auth/login", "/auth/register", "/auth/login/2fa"):
-            is_two_factor = path == "/auth/login/2fa"
-            attempts = self.two_factor_attempts[client_ip] if is_two_factor else self.login_attempts[client_ip]
-            window = self.two_factor_window if is_two_factor else self.window
-            while attempts and attempts[0] < now - window:
+        if path == "/auth/login/2fa":
+            attempts = self.two_factor_attempts[client_ip]
+            while attempts and attempts[0] < now - self.two_factor_window:
                 attempts.popleft()
-            two_factor_limit = self.two_factor_limit if is_two_factor else self.login_limit
-            if len(attempts) >= two_factor_limit:
+            if len(attempts) >= self.two_factor_limit:
                 return Response(
-                    content=(
-                        '{"detail":"Too many 2FA attempts. Please wait 30 minutes."}'
-                        if is_two_factor else
-                        '{"detail":"Too many authentication attempts. Please wait 60 seconds."}'
-                    ),
+                    content='{"detail":"Too many 2FA attempts. Please wait 30 minutes."}',
+                    status_code=429,
+                    media_type="application/json",
+                )
+            response = await call_next(request)
+            if response.status_code in (400, 401):  # failures only
+                attempts.append(time.time())
+            if len(self.general_attempts) > 1000:
+                self._cleanup(now)
+            return response
+
+        # Strict per-IP bucket for primary login/register.
+        if path in ("/auth/login", "/auth/register"):
+            attempts = self.login_attempts[client_ip]
+            while attempts and attempts[0] < now - self.window:
+                attempts.popleft()
+            if len(attempts) >= self.login_limit:
+                return Response(
+                    content='{"detail":"Too many authentication attempts. Please wait 60 seconds."}',
                     status_code=429,
                     media_type="application/json",
                 )

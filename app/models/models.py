@@ -80,6 +80,9 @@ class User(Base):
     role = Column(String, default="user")  # user, merchant, admin
     totp_secret = Column(String, nullable=True)  # TOTP shared secret for 2FA
     totp_enabled = Column(Boolean, default=False)  # whether 2FA is enabled
+    # N02: DB-backed per-user 2FA throttle (migration 014). Failed attempts only.
+    totp_failed_attempts = Column(Integer, default=0, nullable=False)
+    totp_locked_until = Column(DateTime, nullable=True)
 
     listings = relationship("Listing", backref="seller", foreign_keys="Listing.seller_id")
     reviews_given = relationship("Review", backref="reviewer", foreign_keys="Review.reviewer_id")

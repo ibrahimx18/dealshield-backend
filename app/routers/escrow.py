@@ -45,6 +45,7 @@ from app.routers.auth import get_current_user, _update_badge
 from app.core.config import settings
 from app.core.notifications import notify_escrow_event
 from app.core.security_middleware import sanitize_text
+from app.core.client_ip import get_client_ip
 from app.core.money import q, require_amount, money_out, to_decimal, ZERO, MAX_AMOUNT
 from app.core.wallet import debit_wallet, credit_wallet
 from app.core.payment_provider import get_account_provider, UNSUPPORTED_DETAIL
@@ -178,7 +179,7 @@ def _log_audit(db: Session, actor_id: int | None, action: str, request: Request 
     log = AuditLog(
         actor_id=actor_id, action=action, target_type=target_type,
         target_id=target_id,
-        ip_address=request.client.host if request is not None and request.client else None,
+        ip_address=get_client_ip(request) if request is not None else None,
         details=details,
     )
     db.add(log)
