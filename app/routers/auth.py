@@ -2,7 +2,7 @@ import os
 import re
 import time
 from datetime import datetime, timedelta, timezone
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.security import OAuth2PasswordBearer
 import hmac
 from sqlalchemy import update as sa_update
@@ -30,6 +30,7 @@ from app.core.security import (
     new_session_id, credential_version,
 )
 from app.core.security_middleware import sanitize_text, validate_password_strength
+from app.core.client_ip import get_client_ip
 from app.core.kyc_crypto import encrypt_field, decrypt_field, mask_field, verify_id_number
 from app.core.kyc_provider import get_kyc_provider, KYC_PENDING, KYC_VERIFIED, KYC_NONE
 from app.models.models import User, Session as SessionModel, PasswordResetToken, AuditLog
@@ -50,6 +51,42 @@ REFRESH_TOKEN_EXPIRE_DAYS = 30
 PASSWORD_RESET_EXPIRE_HOURS = 1
 # Session cleanup: max active sessions per user
 MAX_ACTIVE_SESSIONS = 5
+# N02: per-user 2FA throttle (DB-backed, shared by all workers)
+TOTP_MAX_FAILURES = 5
+TOTP_LOCK_MINUTES = 15
+
+
+# N16: refresh token lives in an HttpOnly cookie scoped to /auth, so page scripts
+# (and any XSS) cannot read it. SameSite=Strict blocks cross-site sends (CSRF).
+REFRESH_COOKIE = "ds_refresh"
+REFRESH_COOKIE_PATH = "/auth"
+
+
+def _flag(name: str, default: str) -> bool:
+    return os.getenv(name, default).strip().lower() in ("1", "true", "yes")
+
+
+def refresh_body_compat() -> bool:
+    """AUTH_REFRESH_BODY_COMPAT=true (default): still return the refresh token in JSON
+    and accept it in request bodies, for old app/web clients. Set false once every
+    client uses the cookie."""
+    return _flag("AUTH_REFRESH_BODY_COMPAT", "true")
+
+
+def _set_refresh_cookie(response: Response, token: str):
+    response.set_cookie(
+        REFRESH_COOKIE, token, max_age=REFRESH_TOKEN_EXPIRE_DAYS * 86400, path=REFRESH_COOKIE_PATH,
+        httponly=True, secure=_flag("AUTH_COOKIE_SECURE", "true"), samesite="strict",
+    )
+
+
+def _clear_refresh_cookie(response: Response):
+    response.delete_cookie(REFRESH_COOKIE, path=REFRESH_COOKIE_PATH, httponly=True,
+                           secure=_flag("AUTH_COOKIE_SECURE", "true"), samesite="strict")
+
+
+def _body_refresh(token: str) -> str:
+    return token if refresh_body_compat() else ""
 
 
 def _live_session(db: Session, claims: dict) -> SessionModel | None:
@@ -139,7 +176,7 @@ def _log_audit(db: Session, actor_id: int, action: str, request: Request,
         action=action,
         target_type=target_type,
         target_id=target_id,
-        ip_address=request.client.host if request.client else None,
+        ip_address=get_client_ip(request),
         details=details,
     )
     db.add(log)
@@ -167,7 +204,7 @@ def _create_session_record(db: Session, user_id: int, request: Request) -> tuple
         user_id=user_id,
         sid=sid,
         token_hash=hash_token(refresh_token),
-        ip_address=request.client.host if request.client else None,
+        ip_address=get_client_ip(request),
         user_agent=request.headers.get("user-agent", "")[:500],
         expires_at=now + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS),
     ))
@@ -177,7 +214,7 @@ def _create_session_record(db: Session, user_id: int, request: Request) -> tuple
 # ── REGISTER ──
 
 @router.post("/register", response_model=AuthResponse)
-def register(user_in: UserCreate, request: Request, db: Session = Depends(get_db)):
+def register(user_in: UserCreate, request: Request, response: Response, db: Session = Depends(get_db)):
     is_valid, err_msg = validate_password_strength(user_in.password)
     if not is_valid:
         raise HTTPException(status_code=400, detail=err_msg)
@@ -220,9 +257,10 @@ def register(user_in: UserCreate, request: Request, db: Session = Depends(get_db
     # Send email verification (via notification service — logs if SMTP not configured)
     notification_service.notify_email_verification(user.email, email_token, user.name)
 
+    _set_refresh_cookie(response, refresh_token)
     return {
         "access_token": access_token,
-        "refresh_token": refresh_token,
+        "refresh_token": _body_refresh(refresh_token),
         "token_type": "bearer",
         "user": _profile_dict(user),
     }
@@ -231,7 +269,7 @@ def register(user_in: UserCreate, request: Request, db: Session = Depends(get_db
 # ── LOGIN ──
 
 @router.post("/login", response_model=AuthResponse)
-def login(data: UserLogin, request: Request, db: Session = Depends(get_db)):
+def login(data: UserLogin, request: Request, response: Response, db: Session = Depends(get_db)):
     key = data.email_or_phone.lower().strip() if data.email_or_phone else ""
     user = db.query(User).filter((User.email == key) | (User.phone == key)).first()
 
@@ -288,9 +326,10 @@ def login(data: UserLogin, request: Request, db: Session = Depends(get_db)):
     _log_audit(db, user.id, "login", request)
     db.commit()
 
+    _set_refresh_cookie(response, refresh_token)
     return {
         "access_token": access_token,
-        "refresh_token": refresh_token,
+        "refresh_token": _body_refresh(refresh_token),
         "token_type": "bearer",
         "user": _profile_dict(user),
     }
@@ -306,10 +345,18 @@ def me(current_user: User = Depends(get_current_user)):
 # ── REFRESH TOKEN ──
 
 @router.post("/refresh", response_model=TokenResponse)
-def refresh_token(payload: RefreshTokenRequest, request: Request, db: Session = Depends(get_db)):
+def refresh_token(request: Request, response: Response, payload: RefreshTokenRequest | None = None,
+                  db: Session = Depends(get_db)):
     """B06: single-use rotation via one conditional UPDATE. Presenting an already-
-    rotated refresh token (reuse) revokes the whole session."""
-    token_data = decode_refresh_token(payload.refresh_token)
+    rotated refresh token (reuse) revokes the whole session.
+    N16: the token is read from the HttpOnly cookie; the JSON body is accepted only
+    while AUTH_REFRESH_BODY_COMPAT is on."""
+    presented = request.cookies.get(REFRESH_COOKIE) or ""
+    if not presented and payload and payload.refresh_token and refresh_body_compat():
+        presented = payload.refresh_token
+    if not presented:
+        raise HTTPException(status_code=401, detail="No refresh token. Please log in again.")
+    token_data = decode_refresh_token(presented)
     if token_data is None:
         raise HTTPException(status_code=401, detail="Invalid, expired or legacy refresh token. Please log in again.")
     user_id, sid = int(token_data["sub"]), token_data["sid"]
@@ -317,7 +364,7 @@ def refresh_token(payload: RefreshTokenRequest, request: Request, db: Session = 
     if not user or not user.is_active:
         raise HTTPException(status_code=401, detail="User not found or suspended")
 
-    old_hash = hash_token(payload.refresh_token)
+    old_hash = hash_token(presented)
     claims = {"sub": str(user_id), "sid": sid}
     new_access = create_access_token(claims)
     new_refresh = create_refresh_token(claims)
@@ -332,29 +379,36 @@ def refresh_token(payload: RefreshTokenRequest, request: Request, db: Session = 
         db.query(SessionModel).filter(SessionModel.sid == sid, SessionModel.user_id == user_id).update(
             {"revoked": True, "revoked_at": now}, synchronize_session=False)
         db.commit()
-        raise HTTPException(status_code=401, detail="Refresh token already used or session revoked")
+        _clear_refresh_cookie(response)
+        raise HTTPException(status_code=401, detail="Refresh token already used or session revoked",
+                            headers={"Set-Cookie": response.headers.get("set-cookie", "")})
     _log_audit(db, user.id, "token_refresh", request)
     db.commit()
-    return {"access_token": new_access, "refresh_token": new_refresh, "token_type": "bearer"}
+    _set_refresh_cookie(response, new_refresh)
+    return {"access_token": new_access, "refresh_token": _body_refresh(new_refresh), "token_type": "bearer"}
 
 
 # ── LOGOUT / REVOKE ──
 
 @router.post("/logout")
-def logout(request: Request, payload: LogoutRequest | None = None,
+def logout(request: Request, response: Response, payload: LogoutRequest | None = None,
            token: str | None = Depends(optional_oauth2), db: Session = Depends(get_db)):
     """B05: revoke the server-side session named by the bearer access token (and/or
     the refresh token). After this, the access token is rejected on every route."""
     revoked = 0
     now = datetime.utcnow()
+    body_refresh = payload.refresh_token if payload and payload.refresh_token and refresh_body_compat() else None
+    cookie_refresh = request.cookies.get(REFRESH_COOKIE) or None
     for claims in (decode_access_token(token) if token else None,
-                   decode_refresh_token(payload.refresh_token) if payload and payload.refresh_token else None):
+                   decode_refresh_token(cookie_refresh) if cookie_refresh else None,
+                   decode_refresh_token(body_refresh) if body_refresh else None):
         if claims:
             revoked += db.query(SessionModel).filter(
                 SessionModel.sid == claims["sid"], SessionModel.user_id == int(claims["sub"]),
                 SessionModel.revoked == False,
             ).update({"revoked": True, "revoked_at": now}, synchronize_session=False)
     db.commit()
+    _clear_refresh_cookie(response)  # N16
     return {"detail": "Logged out successfully", "revoked": bool(revoked)}
 
 
@@ -700,7 +754,7 @@ def disable_2fa(payload: Disable2FARequest, request: Request, current_user: User
 
 
 @router.post("/login/2fa", response_model=AuthResponse)
-def login_2fa(payload: Login2FARequest, request: Request, db: Session = Depends(get_db)):
+def login_2fa(payload: Login2FARequest, request: Request, response: Response, db: Session = Depends(get_db)):
     """Complete login for a 2FA-enabled user.
     Accepts the temp token from /auth/login + a TOTP code (or backup code).
     Returns full access + refresh tokens on success.
@@ -722,17 +776,45 @@ def login_2fa(payload: Login2FARequest, request: Request, db: Session = Depends(
                                credential_version(user.hashed_password, user.totp_secret)):
         raise HTTPException(status_code=401, detail="Credentials changed. Please start login again.")
 
+    # N02: per-user lock (DB-backed, so every worker and restart sees it).
+    now = datetime.utcnow()
+    if user.totp_locked_until and user.totp_locked_until > now:
+        retry_after = max(1, int((user.totp_locked_until - now).total_seconds()))
+        raise HTTPException(status_code=429, detail="Too many failed 2FA attempts. Try again later.",
+                            headers={"Retry-After": str(retry_after)})
+    if user.totp_locked_until and user.totp_locked_until <= now:
+        user.totp_locked_until = None
+        user.totp_failed_attempts = 0
+        db.flush()  # persist the reset BEFORE any atomic +1 below
+
+    def _fail(detail: str):
+        # Atomic increment so parallel guesses cannot undercount.
+        db.query(User).filter(User.id == user.id).update(
+            {"totp_failed_attempts": User.totp_failed_attempts + 1}, synchronize_session=False)
+        db.flush()
+        failures = db.query(User.totp_failed_attempts).filter(User.id == user.id).scalar() or 0
+        locked = failures >= TOTP_MAX_FAILURES
+        if locked:
+            db.query(User).filter(User.id == user.id).update(
+                {"totp_locked_until": now + timedelta(minutes=TOTP_LOCK_MINUTES)}, synchronize_session=False)
+        _log_audit(db, user.id, "login_2fa_failed", request)
+        db.commit()
+        if locked:
+            raise HTTPException(status_code=429, detail="Too many failed 2FA attempts. Try again later.",
+                                headers={"Retry-After": str(TOTP_LOCK_MINUTES * 60)})
+        raise HTTPException(status_code=401, detail=detail)
+
     totp_code = payload.totp_code.strip()
     stored = user.totp_secret
     parts = stored.split("|")
     if totp_code.isdigit() and len(totp_code) == 6:
         if not verify_totp(parts[0], totp_code):
-            raise HTTPException(status_code=401, detail="Invalid TOTP code")
+            _fail("Invalid TOTP code")
     elif len(totp_code) == 8 and all(c in "0123456789abcdefABCDEF" for c in totp_code):
         code_hash = hash_token(totp_code.upper())
         matched = next((c for c in parts[1:] if hmac.compare_digest(c, code_hash)), None)
         if matched is None:
-            raise HTTPException(status_code=401, detail="Invalid backup code")
+            _fail("Invalid backup code")
         remaining = [c for c in parts[1:] if c != matched]
         rows = db.query(User).filter(User.id == user.id, User.totp_secret == stored).update(
             {"totp_secret": "|".join([parts[0]] + remaining)}, synchronize_session=False)
@@ -740,15 +822,18 @@ def login_2fa(payload: Login2FARequest, request: Request, db: Session = Depends(
             db.rollback()
             raise HTTPException(status_code=401, detail="Backup code already used")
     else:
-        raise HTTPException(status_code=401, detail="Invalid TOTP code format")
+        _fail("Invalid TOTP code format")
 
+    user.totp_failed_attempts = 0  # N02: reset on success
+    user.totp_locked_until = None
     access_token, refresh_token = _create_session_record(db, user.id, request)
     _log_audit(db, user.id, "login_2fa_success", request)
     db.commit()
 
+    _set_refresh_cookie(response, refresh_token)
     return {
         "access_token": access_token,
-        "refresh_token": refresh_token,
+        "refresh_token": _body_refresh(refresh_token),
         "token_type": "bearer",
         "user": _profile_dict(user),
     }

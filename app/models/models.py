@@ -80,6 +80,9 @@ class User(Base):
     role = Column(String, default="user")  # user, merchant, admin
     totp_secret = Column(String, nullable=True)  # TOTP shared secret for 2FA
     totp_enabled = Column(Boolean, default=False)  # whether 2FA is enabled
+    # N02: DB-backed per-user 2FA throttle (migration 014). Failed attempts only.
+    totp_failed_attempts = Column(Integer, default=0, nullable=False)
+    totp_locked_until = Column(DateTime, nullable=True)
 
     listings = relationship("Listing", backref="seller", foreign_keys="Listing.seller_id")
     reviews_given = relationship("Review", backref="reviewer", foreign_keys="Review.reviewer_id")
@@ -148,6 +151,7 @@ class EscrowTransaction(Base):
     fulfilment_started_at = Column(DateTime, nullable=True) # seller began fulfilling
     buyer_review_started_at = Column(DateTime, nullable=True)  # buyer received goods
     buyer_review_deadline = Column(DateTime, nullable=True)    # auto-release after this
+    buyer_review_reminder_sent_at = Column(DateTime, nullable=True)  # N05: pre-auto-release reminder
     dispute_reason = Column(Text, nullable=True)           # who disputed and why
     dispute_evidence = Column(Text, nullable=True)         # JSON: links, docs, messages
     dispute_initiated_by = Column(String, default="")      # buyer or seller
@@ -177,6 +181,8 @@ class EscrowTransaction(Base):
     # ── Release OTP (buyer enters code to release funds) ──
     release_otp = Column(String, default="")              # 6-digit OTP generated when buyer_review starts
     release_otp_expiry = Column(DateTime, nullable=True)  # OTP validity window
+    release_otp_attempts = Column(Integer, default=0, nullable=False)
+    release_otp_locked_until = Column(DateTime(timezone=True), nullable=True)
     # ── Shareable deal link ──
     share_token = Column(String, default="")              # unique token for shareable deal link
 

@@ -146,7 +146,12 @@ def seed():
 
 seed()
 
-app = FastAPI(title="DealShield API", version="1.1.0")
+# N07: no public route map in production
+_IS_PROD = os.getenv("ENVIRONMENT", "development").strip().lower() == "production"
+app = FastAPI(title="DealShield API", version="1.1.0",
+              docs_url=None if _IS_PROD else "/docs",
+              redoc_url=None if _IS_PROD else "/redoc",
+              openapi_url=None if _IS_PROD else "/openapi.json")
 
 # Wire up rate limiter (moved from above — needs app to exist first)
 app.state.limiter = limiter
@@ -158,7 +163,9 @@ app.add_middleware(HTTPSRedirectMiddleware)
 app.add_middleware(RateLimitMiddleware)
 
 # ── CORS — restricted origins only (was: allow_origins=["*"]) ──
-ALLOWED_ORIGINS = os.getenv("SAFEPAY_CORS_ORIGINS", "http://localhost:8080,http://15.204.248.160:8000").split(",")
+# N16: exact origins only (never "*" with credentials); https-only in production.
+from app.core.cors import parse_cors_origins
+ALLOWED_ORIGINS = parse_cors_origins()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,

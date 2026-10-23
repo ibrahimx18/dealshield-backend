@@ -20,8 +20,15 @@ PostgreSQL unless noted, and are idempotent (IF NOT EXISTS) except 010 and 012.
 | 11 | 010_money_numeric_constraints.sql | **new** - run the pre-flight SELECTs first |
 | 12 | 011_webhook_idempotency.sql | **new** |
 | 13 | 012_sessions_kyc_status.sql | **new** - revokes all sessions (everyone re-logs in), resets KYC to pending review |
+| 14 | 013_otp_attempt_limits.sql | **new** - persistent failed release-OTP counter + 15-minute lock after five guesses |
 
-New migrations start at 013. Never reuse a number.
+| 15 | 014_totp_attempt_limits.sql | **new** (N02) - users.totp_failed_attempts / totp_locked_until: per-user 2FA lock |
+| 16 | 015_backfill_model_columns.sql | **new** (N09) - ADD COLUMN IF NOT EXISTS for model columns no earlier file created (role, otp_*, pickup_*, rider_*, ...). No-op where they already exist |
+| 17 | 016_buyer_review_reminder.sql | **new** (N05) - escrow_transactions.buyer_review_reminder_sent_at |
 
-Before running 010-012 on production: take a backup, rehearse on a restored copy,
+After the last step run `python scripts/check_schema_drift.py` (read-only) - it must print `OK`.
+
+New migrations start at 017. Never reuse a number.
+
+Before running 010-016 on production: take a backup, rehearse on a restored copy,
 and run each file inside its own transaction (they contain BEGIN/COMMIT).

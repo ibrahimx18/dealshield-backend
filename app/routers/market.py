@@ -1,4 +1,5 @@
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, HTTPException
+from app.core.access import build_admin_or_integration
 from sqlalchemy.orm import Session
 from typing import Optional
 import requests as http_requests
@@ -8,6 +9,8 @@ from app.schemas.schemas import MarketPriceListResponse
 from app.models.models import MarketPrice
 
 router = APIRouter()
+# N07: forcing a live refresh (4 outbound calls + DB writes) is admin/integration only
+_admin_or_integration = build_admin_or_integration()
 
 # Fallback static rates (updated Aug 20, 2026)
 FALLBACK_RATES = {
@@ -116,8 +119,12 @@ def get_prices(
     category: Optional[str] = Query(None),
     refresh: bool = Query(False),
     db: Session = Depends(get_db),
+    privileged: bool = Depends(_admin_or_integration.check),
 ):
-    # Auto-refresh prices if DB is empty or refresh requested
+    # N07: refresh=true needs an admin session or the integration secret.
+    # An empty table (first boot) is still filled once for anyone.
+    if refresh and not privileged:
+        raise HTTPException(status_code=403, detail="Admin or integration secret required")
     count = db.query(MarketPrice).count()
     if count == 0 or refresh:
         update_prices_in_db(db)
@@ -138,7 +145,7 @@ def get_prices(
 
 
 @router.post("/refresh")
-def refresh_prices(db: Session = Depends(get_db)):
+def refresh_prices(db: Session = Depends(get_db), _ok: bool = Depends(_admin_or_integration)):
     """Force refresh market prices from live API sources."""
     update_prices_in_db(db)
     prices = db.query(MarketPrice).all()

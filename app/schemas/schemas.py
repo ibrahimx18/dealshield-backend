@@ -44,12 +44,13 @@ class AuthResponse(BaseModel):
 
 
 class RefreshTokenRequest(BaseModel):
-    refresh_token: str
+    # N16: optional - the HttpOnly cookie is preferred; body kept for old clients
+    refresh_token: Optional[str] = None
 
 
 class TokenResponse(BaseModel):
     access_token: str
-    refresh_token: str
+    refresh_token: str = ""
     token_type: str = "bearer"
 
 

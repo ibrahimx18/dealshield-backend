@@ -13,6 +13,9 @@ import logging
 
 logger = logging.getLogger("dealshield.notifications")
 
+# N05: reminder is sent this many hours before the 24-hour buyer review deadline
+REVIEW_REMINDER_HOURS = 3
+
 
 class NotificationService:
     """Sends email and SMS notifications. Falls back to logging if providers not configured."""
@@ -140,7 +143,9 @@ This token expires in 30 minutes. If you did not request this, please ignore thi
             "seller_accepted": f"DealShield: Deal '{tx_title}' accepted by seller. Please fund within 24h.",
             "funded": f"DealShield: Deal '{tx_title}' has been funded. Seller can now fulfil.",
             "seller_fulfilling": f"DealShield: Seller has started fulfilment for '{tx_title}'.",
-            "buyer_review": f"DealShield: Goods delivered for '{tx_title}'. You have 7 days to review.",
+            "buyer_review": f"DealShield: Goods delivered for '{tx_title}'. You have 24 hours to confirm or raise a dispute; after that the funds are released to the seller automatically.",
+            "buyer_review_reminder": f"DealShield: Reminder - funds for '{tx_title}' will be released to the seller automatically within {REVIEW_REMINDER_HOURS} hours unless you confirm or raise a dispute.",
+            "auto_released": f"DealShield: The 24-hour review window for '{tx_title}' ended, so the funds were released to the seller.",
             "released": f"DealShield: Funds released for '{tx_title}'. Transaction complete.",
             "disputed": f"DealShield: Dispute raised for '{tx_title}'. Our team will investigate.",
             "under_investigation": f"DealShield: Your dispute for '{tx_title}' is under investigation.",
@@ -189,3 +194,18 @@ def notify_escrow_event(tx_data: dict, event: str):
     logger.info(f"[ESCROW] Event: {event}, Tx: {tx_data.get('id')}, Status: {tx_data.get('status')}")
     # In production, this would send SMS/email to buyer + seller
     # For now, it just logs. The notification_service handles actual delivery.
+
+
+def notify_buyer_review(db, tx, status: str) -> bool:
+    """N05: send a buyer-facing escrow status message (SMS + email). Never raises:
+    a notification failure must not block or roll back a money movement."""
+    try:
+        from app.models.models import User
+        buyer = db.query(User).filter(User.id == tx.buyer_id).first()
+        if not buyer:
+            return False
+        notification_service.notify_escrow_status(buyer.phone, buyer.email, tx.listing_title, status, "buyer")
+        return True
+    except Exception as e:  # pragma: no cover - defensive
+        logger.error(f"[ESCROW] buyer notification failed for tx {getattr(tx, 'id', '?')}: {type(e).__name__}")
+        return False

@@ -43,8 +43,9 @@ from app.models.models import (EscrowTransaction, User, Listing, WalletTx, Audit
 from sqlalchemy.exc import IntegrityError
 from app.routers.auth import get_current_user, _update_badge
 from app.core.config import settings
-from app.core.notifications import notify_escrow_event
+from app.core.notifications import notify_escrow_event, notify_buyer_review, REVIEW_REMINDER_HOURS
 from app.core.security_middleware import sanitize_text
+from app.core.client_ip import get_client_ip
 from app.core.money import q, require_amount, money_out, to_decimal, ZERO, MAX_AMOUNT
 from app.core.wallet import debit_wallet, credit_wallet
 from app.core.payment_provider import get_account_provider, UNSUPPORTED_DETAIL
@@ -65,6 +66,8 @@ CANCELLATION_FEE = Decimal("5000.00")
 ACCEPT_DEADLINE_HOURS = 48       # Seller must accept within 48h
 PAYMENT_DEADLINE_HOURS = 24      # Buyer must fund within 24h after seller accepts
 BUYER_REVIEW_DAYS = 1             # Auto-release after 24 hours if buyer is silent
+RELEASE_OTP_MAX_ATTEMPTS = 5
+RELEASE_OTP_LOCK_MINUTES = 15
 
 
 def _calc_gateway_fee(amount) -> Decimal:
@@ -176,7 +179,7 @@ def _log_audit(db: Session, actor_id: int | None, action: str, request: Request 
     log = AuditLog(
         actor_id=actor_id, action=action, target_type=target_type,
         target_id=target_id,
-        ip_address=request.client.host if request is not None and request.client else None,
+        ip_address=get_client_ip(request) if request is not None else None,
         details=details,
     )
     db.add(log)
@@ -469,15 +472,18 @@ def mark_delivered(tx_id: int, request: Request,
         raise HTTPException(status_code=400, detail=f"Cannot deliver — current status: {tx.status}")
 
     now = datetime.utcnow()
-    # Generate 6-digit release OTP for buyer (CSPRNG)
+    # Generate 6-digit release OTP for buyer (CSPRNG); reset throttling state
     _transition(db, tx, {"status": "buyer_review", "buyer_review_started_at": now,
                          "buyer_review_deadline": now + timedelta(days=BUYER_REVIEW_DAYS),
-                         "release_otp": _new_otp(), "release_otp_expiry": now + timedelta(hours=24)})
+                         "release_otp": _new_otp(), "release_otp_expiry": now + timedelta(hours=24),
+                         "release_otp_attempts": 0, "release_otp_locked_until": None,
+                         "buyer_review_reminder_sent_at": None})
 
     _log_audit(db, current_user.id, "escrow_delivered_to_buyer", request, target_id=tx.id)
     db.commit()
     db.refresh(tx)
     notify_escrow_event(_tx_dict(tx), "escrow_buyer_review")
+    notify_buyer_review(db, tx, "buyer_review")  # N05: 24-hour window has started
     return _tx_dict(tx)
 
 
@@ -531,7 +537,8 @@ def release_with_otp(tx_id: int, otp_in: ReleaseOTPRequest, request: Request,
     """Buyer submits the 6-digit OTP to release funds to seller.
     Alternative to manual /approve — provides OTP-based verification.
     """
-    tx = db.query(EscrowTransaction).filter(EscrowTransaction.id == tx_id).first()
+    # Serialize OTP checks so parallel guesses cannot race the attempt counter.
+    tx = db.query(EscrowTransaction).filter(EscrowTransaction.id == tx_id).with_for_update().first()
     if not tx:
         raise HTTPException(status_code=404, detail="Transaction not found")
     if tx.buyer_id != current_user.id:
@@ -543,13 +550,33 @@ def release_with_otp(tx_id: int, otp_in: ReleaseOTPRequest, request: Request,
     if tx.release_otp_expiry and datetime.utcnow() > _strip_tz(tx.release_otp_expiry):
         raise HTTPException(status_code=400, detail="OTP has expired. Contact support or use manual approval.")
 
-    if otp_in.otp.strip() != tx.release_otp:
+    now = datetime.utcnow()
+    locked_until = _strip_tz(tx.release_otp_locked_until)
+    if locked_until and now < locked_until:
+        retry_after = max(1, int((locked_until - now).total_seconds()))
+        raise HTTPException(status_code=429, detail="Release code temporarily locked after failed attempts.",
+                            headers={"Retry-After": str(retry_after)})
+    if locked_until and now >= locked_until:
+        # N10: an expired lock starts a fresh window of RELEASE_OTP_MAX_ATTEMPTS guesses.
+        tx.release_otp_attempts = 0
+        tx.release_otp_locked_until = None
+
+    if not hmac.compare_digest(otp_in.otp.strip().encode(), (tx.release_otp or "").encode()):
+        tx.release_otp_attempts = (tx.release_otp_attempts or 0) + 1
+        if tx.release_otp_attempts >= RELEASE_OTP_MAX_ATTEMPTS:
+            tx.release_otp_locked_until = now + timedelta(minutes=RELEASE_OTP_LOCK_MINUTES)
+        _log_audit(db, current_user.id, "escrow_otp_failed", request, target_id=tx.id)
+        db.commit()
+        if tx.release_otp_locked_until:
+            raise HTTPException(status_code=429, detail="Release code temporarily locked after failed attempts.",
+                                headers={"Retry-After": str(RELEASE_OTP_LOCK_MINUTES * 60)})
         raise HTTPException(status_code=400, detail="Invalid OTP code")
 
-    now = datetime.utcnow()
-    # Clear OTP after use
+    # Clear OTP and its throttling state after successful use.
     tx.release_otp = ""
     tx.release_otp_expiry = None
+    tx.release_otp_attempts = 0
+    tx.release_otp_locked_until = None
 
     rows = db.query(EscrowTransaction).filter(
         EscrowTransaction.id == tx_id,
@@ -574,12 +601,22 @@ def release_with_otp(tx_id: int, otp_in: ReleaseOTPRequest, request: Request,
 
 # ── 7c. GET RELEASE OTP — Buyer retrieves their OTP (for demo/testing) ──
 
+def _release_otp_demo_enabled() -> bool:
+    import os
+    env = os.getenv("ENVIRONMENT", "development").strip().lower()
+    test_mode = os.getenv("SAFEPAY_TEST_MODE", "false").strip().lower() in ("1", "true", "yes")
+    return env != "production" and test_mode
+
+
 @router.get("/{tx_id}/release-otp")
 def get_release_otp(tx_id: int, current_user: User = Depends(get_current_user),
                     db: Session = Depends(get_db)):
-    """Buyer retrieves their release OTP. In production, this would be sent via SMS/email.
-    For now, returns it directly (demo mode).
+    """Buyer retrieves their release OTP - DEMO ONLY (N11).
+    Available only when ENVIRONMENT != production AND SAFEPAY_TEST_MODE is true;
+    otherwise 404 (the code reaches the buyer by SMS/email, never via this route).
     """
+    if not _release_otp_demo_enabled():
+        raise HTTPException(status_code=404, detail="Not found")
     tx = db.query(EscrowTransaction).filter(EscrowTransaction.id == tx_id).first()
     if not tx:
         raise HTTPException(status_code=404, detail="Transaction not found")
@@ -664,7 +701,28 @@ def process_expired_reviews(request: Request,
         EscrowTransaction.buyer_review_deadline < now,
     ).all()
 
+    # N05: reminder pass - deals whose deadline is within REVIEW_REMINDER_HOURS and
+    # that have not been reminded yet. Claimed with a conditional UPDATE so two
+    # concurrent runs cannot send the reminder twice.
+    reminded_count = 0
+    due = db.query(EscrowTransaction).filter(
+        EscrowTransaction.status == "buyer_review",
+        EscrowTransaction.buyer_review_deadline >= now,
+        EscrowTransaction.buyer_review_deadline <= now + timedelta(hours=REVIEW_REMINDER_HOURS),
+        EscrowTransaction.buyer_review_reminder_sent_at.is_(None),
+    ).all()
+    for tx in due:
+        claimed = db.query(EscrowTransaction).filter(
+            EscrowTransaction.id == tx.id, EscrowTransaction.status == "buyer_review",
+            EscrowTransaction.buyer_review_reminder_sent_at.is_(None),
+        ).update({"buyer_review_reminder_sent_at": now}, synchronize_session=False)
+        db.commit()
+        if claimed == 1:
+            notify_buyer_review(db, tx, "buyer_review_reminder")
+            reminded_count += 1
+
     released_count = 0
+    released_txs = []
     for tx in expired_txs:
         # Atomic conditional update
         rows = db.query(EscrowTransaction).filter(
@@ -678,9 +736,13 @@ def process_expired_reviews(request: Request,
             released_count += 1
             _log_audit(db, current_user.id, "escrow_auto_release", request,
                        target_id=tx.id, details="Buyer review deadline expired")
+            released_txs.append(tx)
 
     db.commit()
-    return {"detail": f"Processed {released_count} expired reviews (auto-released)"}
+    for tx in released_txs:  # after commit: never notify about money that did not move
+        notify_buyer_review(db, tx, "auto_released")
+    return {"detail": f"Processed {released_count} expired reviews (auto-released)",
+            "released": released_count, "reminded": reminded_count}
 
 
 # ── 11. AUTO-EXPIRE — Process expired accept/payment deadlines ──
@@ -969,7 +1031,9 @@ def confirm_receipt_legacy(tx_id: int, request: Request,
         now = datetime.utcnow()
         _transition(db, tx, {"status": "buyer_review", "buyer_review_started_at": now,
                              "buyer_review_deadline": now + timedelta(days=BUYER_REVIEW_DAYS),
-                             "release_otp": _new_otp(), "release_otp_expiry": now + timedelta(hours=24)})
+                             "release_otp": _new_otp(), "release_otp_expiry": now + timedelta(hours=24),
+                             "release_otp_attempts": 0, "release_otp_locked_until": None,
+                         "buyer_review_reminder_sent_at": None})
     return buyer_approve(tx_id, request, current_user, db)
 
 

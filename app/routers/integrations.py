@@ -15,6 +15,11 @@ from app.core.config import settings
 
 router = APIRouter()
 
+COMPLETED_STATUSES = ("released", "closed", "delivered")
+DISPUTED_STATUSES = ("disputed", "under_investigation")
+ACTIVE_STATUSES = ("funded", "seller_fulfilling", "buyer_review", "buyer_approved",
+                   "funds_deposited", "shipped")
+
 # Integration secret — n8n must pass this in X-SafePay-Secret header
 # No insecure fallback — app.main.validate_required_secrets() enforces this is set at startup.
 INTEGRATION_SECRET = os.getenv("SAFEPAY_WEBHOOK_SECRET", "")
@@ -46,9 +51,10 @@ def deal_stats(days: int = 7, db: Session = Depends(get_db)):
     for t in txs:
         status_counts[t.status] = status_counts.get(t.status, 0) + 1
 
-    completed = [t for t in txs if t.status == "delivered"]
-    disputed = [t for t in txs if t.status == "disputed"]
-    active = [t for t in txs if t.status in ("funds_deposited", "shipped")]
+    # N08: current statuses (legacy ones kept so old rows still count)
+    completed = [t for t in txs if t.status in COMPLETED_STATUSES]
+    disputed = [t for t in txs if t.status in DISPUTED_STATUSES]
+    active = [t for t in txs if t.status in ACTIVE_STATUSES]
 
     # Category breakdown
     by_category = {}
