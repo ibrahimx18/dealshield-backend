@@ -10,6 +10,8 @@ from app.core.security_middleware import sanitize_text
 
 router = APIRouter()
 
+REVIEWABLE_STATUSES = ("released", "closed", "delivered")
+
 
 def _review_dict(r: Review, reviewer_name: str = None) -> dict:
     return {
@@ -29,8 +31,9 @@ def create_review(review_in: ReviewCreate, current_user: User = Depends(get_curr
     tx = db.query(EscrowTransaction).filter(EscrowTransaction.id == review_in.escrow_id).first()
     if not tx:
         raise HTTPException(status_code=404, detail="Transaction not found")
-    if tx.status != "delivered":
-        raise HTTPException(status_code=400, detail="Can only review after delivery is confirmed")
+    # N08: the current flow ends at released/closed; legacy 'delivered' still allowed.
+    if tx.status not in REVIEWABLE_STATUSES:
+        raise HTTPException(status_code=400, detail="Can only review a completed deal")
     if current_user.id not in (tx.buyer_id, tx.seller_id):
         raise HTTPException(status_code=403, detail="Not part of this transaction")
 
