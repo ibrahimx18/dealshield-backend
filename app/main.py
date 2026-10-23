@@ -146,7 +146,12 @@ def seed():
 
 seed()
 
-app = FastAPI(title="DealShield API", version="1.1.0")
+# N07: no public route map in production
+_IS_PROD = os.getenv("ENVIRONMENT", "development").strip().lower() == "production"
+app = FastAPI(title="DealShield API", version="1.1.0",
+              docs_url=None if _IS_PROD else "/docs",
+              redoc_url=None if _IS_PROD else "/redoc",
+              openapi_url=None if _IS_PROD else "/openapi.json")
 
 # Wire up rate limiter (moved from above — needs app to exist first)
 app.state.limiter = limiter

@@ -3,13 +3,22 @@
 - /ai/fraud-check: analyze a listing for potential fraud
 """
 
-from fastapi import APIRouter, HTTPException
+import logging
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 import requests
 import os
 import json
 
+from app.routers.auth import get_current_user
+from app.models.models import User
+from app.core.access import KeyedRateLimiter
+
 router = APIRouter()
+logger = logging.getLogger("dealshield.ai")
+# N07: login required + 20 AI calls per user per 10 minutes (per worker)
+_ai_limiter = KeyedRateLimiter(limit=20, window_seconds=600)
+_AI_UNAVAILABLE = "AI service is temporarily unavailable"
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434/api/chat")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
@@ -71,8 +80,11 @@ Red flags to check:
 
 
 @router.post("/chat", response_model=ChatResponse, summary="Chat with local LLM via Ollama")
-async def chat(req: ChatRequest):
+def chat(req: ChatRequest, current_user: User = Depends(get_current_user)):
     """Send a user message to Ollama and return the assistant reply."""
+    _ai_limiter.check(current_user.id)
+    if len(req.message or "") > 4000:
+        raise HTTPException(status_code=400, detail="Message too long")
     payload = {
         "model": OLLAMA_MODEL,
         "messages": [{"role": "user", "content": req.message}],
@@ -82,14 +94,16 @@ async def chat(req: ChatRequest):
         resp = requests.post(OLLAMA_URL, json=payload, timeout=60)
         resp.raise_for_status()
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Failed to contact Ollama: {e}")
+        logger.warning("AI chat upstream error: %s", type(e).__name__)
+        raise HTTPException(status_code=502, detail=_AI_UNAVAILABLE)
     data = resp.json()
     return ChatResponse(reply=data.get("message", {}).get("content", ""))
 
 
 @router.post("/fraud-check", response_model=FraudCheckResponse, summary="AI fraud analysis of a listing")
-async def fraud_check(req: FraudCheckRequest):
+def fraud_check(req: FraudCheckRequest, current_user: User = Depends(get_current_user)):
     """Analyze a listing for fraud risk using Ollama."""
+    _ai_limiter.check(current_user.id)
     prompt = FRAUD_PROMPT.format(
         title=req.title,
         description=req.description,
@@ -109,7 +123,8 @@ async def fraud_check(req: FraudCheckRequest):
         resp = requests.post(OLLAMA_URL, json=payload, timeout=60)
         resp.raise_for_status()
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Fraud check failed: {e}")
+        logger.warning("AI fraud-check upstream error: %s", type(e).__name__)
+        raise HTTPException(status_code=502, detail=_AI_UNAVAILABLE)
 
     data = resp.json()
     content = data.get("message", {}).get("content", "{}")
