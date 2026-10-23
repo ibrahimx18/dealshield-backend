@@ -151,6 +151,7 @@ class EscrowTransaction(Base):
     fulfilment_started_at = Column(DateTime, nullable=True) # seller began fulfilling
     buyer_review_started_at = Column(DateTime, nullable=True)  # buyer received goods
     buyer_review_deadline = Column(DateTime, nullable=True)    # auto-release after this
+    buyer_review_reminder_sent_at = Column(DateTime, nullable=True)  # N05: pre-auto-release reminder
     dispute_reason = Column(Text, nullable=True)           # who disputed and why
     dispute_evidence = Column(Text, nullable=True)         # JSON: links, docs, messages
     dispute_initiated_by = Column(String, default="")      # buyer or seller

@@ -43,7 +43,7 @@ from app.models.models import (EscrowTransaction, User, Listing, WalletTx, Audit
 from sqlalchemy.exc import IntegrityError
 from app.routers.auth import get_current_user, _update_badge
 from app.core.config import settings
-from app.core.notifications import notify_escrow_event
+from app.core.notifications import notify_escrow_event, notify_buyer_review, REVIEW_REMINDER_HOURS
 from app.core.security_middleware import sanitize_text
 from app.core.client_ip import get_client_ip
 from app.core.money import q, require_amount, money_out, to_decimal, ZERO, MAX_AMOUNT
@@ -476,12 +476,14 @@ def mark_delivered(tx_id: int, request: Request,
     _transition(db, tx, {"status": "buyer_review", "buyer_review_started_at": now,
                          "buyer_review_deadline": now + timedelta(days=BUYER_REVIEW_DAYS),
                          "release_otp": _new_otp(), "release_otp_expiry": now + timedelta(hours=24),
-                         "release_otp_attempts": 0, "release_otp_locked_until": None})
+                         "release_otp_attempts": 0, "release_otp_locked_until": None,
+                         "buyer_review_reminder_sent_at": None})
 
     _log_audit(db, current_user.id, "escrow_delivered_to_buyer", request, target_id=tx.id)
     db.commit()
     db.refresh(tx)
     notify_escrow_event(_tx_dict(tx), "escrow_buyer_review")
+    notify_buyer_review(db, tx, "buyer_review")  # N05: 24-hour window has started
     return _tx_dict(tx)
 
 
@@ -699,7 +701,28 @@ def process_expired_reviews(request: Request,
         EscrowTransaction.buyer_review_deadline < now,
     ).all()
 
+    # N05: reminder pass - deals whose deadline is within REVIEW_REMINDER_HOURS and
+    # that have not been reminded yet. Claimed with a conditional UPDATE so two
+    # concurrent runs cannot send the reminder twice.
+    reminded_count = 0
+    due = db.query(EscrowTransaction).filter(
+        EscrowTransaction.status == "buyer_review",
+        EscrowTransaction.buyer_review_deadline >= now,
+        EscrowTransaction.buyer_review_deadline <= now + timedelta(hours=REVIEW_REMINDER_HOURS),
+        EscrowTransaction.buyer_review_reminder_sent_at.is_(None),
+    ).all()
+    for tx in due:
+        claimed = db.query(EscrowTransaction).filter(
+            EscrowTransaction.id == tx.id, EscrowTransaction.status == "buyer_review",
+            EscrowTransaction.buyer_review_reminder_sent_at.is_(None),
+        ).update({"buyer_review_reminder_sent_at": now}, synchronize_session=False)
+        db.commit()
+        if claimed == 1:
+            notify_buyer_review(db, tx, "buyer_review_reminder")
+            reminded_count += 1
+
     released_count = 0
+    released_txs = []
     for tx in expired_txs:
         # Atomic conditional update
         rows = db.query(EscrowTransaction).filter(
@@ -713,9 +736,13 @@ def process_expired_reviews(request: Request,
             released_count += 1
             _log_audit(db, current_user.id, "escrow_auto_release", request,
                        target_id=tx.id, details="Buyer review deadline expired")
+            released_txs.append(tx)
 
     db.commit()
-    return {"detail": f"Processed {released_count} expired reviews (auto-released)"}
+    for tx in released_txs:  # after commit: never notify about money that did not move
+        notify_buyer_review(db, tx, "auto_released")
+    return {"detail": f"Processed {released_count} expired reviews (auto-released)",
+            "released": released_count, "reminded": reminded_count}
 
 
 # ── 11. AUTO-EXPIRE — Process expired accept/payment deadlines ──
@@ -1005,7 +1032,8 @@ def confirm_receipt_legacy(tx_id: int, request: Request,
         _transition(db, tx, {"status": "buyer_review", "buyer_review_started_at": now,
                              "buyer_review_deadline": now + timedelta(days=BUYER_REVIEW_DAYS),
                              "release_otp": _new_otp(), "release_otp_expiry": now + timedelta(hours=24),
-                             "release_otp_attempts": 0, "release_otp_locked_until": None})
+                             "release_otp_attempts": 0, "release_otp_locked_until": None,
+                         "buyer_review_reminder_sent_at": None})
     return buyer_approve(tx_id, request, current_user, db)
 
 
