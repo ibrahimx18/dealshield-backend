@@ -110,3 +110,28 @@ def test_only_buyer_can_consume_release_otp_attempts():
         assert db.query(EscrowTransaction.release_otp_attempts).filter_by(id=tx_id).scalar() == 0
     finally:
         db.close()
+
+
+def test_expired_release_lock_resets_attempts_before_counting():
+    """N10: after the 15-minute lock ends, a wrong guess is attempt 1 (400), not a new lock (429)."""
+    buyer_id, _, tx_id = make_buyer_and_transaction()
+    db = SessionLocal()
+    try:
+        db.query(EscrowTransaction).filter_by(id=tx_id).update(
+            {"release_otp_attempts": 5,
+             "release_otp_locked_until": datetime.utcnow() - timedelta(minutes=1)})
+        db.commit()
+    finally:
+        db.close()
+    token = session_token(buyer_id)
+    with TestClient(app, client=("198.51.100.47", 43210)) as client:
+        r = client.post(f"/escrow/{tx_id}/release-otp", json={"otp": "000000"},
+                        headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 400, r.text
+    db = SessionLocal()
+    try:
+        tx = db.query(EscrowTransaction).filter_by(id=tx_id).one()
+        assert tx.release_otp_attempts == 1
+        assert tx.release_otp_locked_until is None
+    finally:
+        db.close()

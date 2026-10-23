@@ -554,6 +554,10 @@ def release_with_otp(tx_id: int, otp_in: ReleaseOTPRequest, request: Request,
         retry_after = max(1, int((locked_until - now).total_seconds()))
         raise HTTPException(status_code=429, detail="Release code temporarily locked after failed attempts.",
                             headers={"Retry-After": str(retry_after)})
+    if locked_until and now >= locked_until:
+        # N10: an expired lock starts a fresh window of RELEASE_OTP_MAX_ATTEMPTS guesses.
+        tx.release_otp_attempts = 0
+        tx.release_otp_locked_until = None
 
     if not hmac.compare_digest(otp_in.otp.strip().encode(), (tx.release_otp or "").encode()):
         tx.release_otp_attempts = (tx.release_otp_attempts or 0) + 1
