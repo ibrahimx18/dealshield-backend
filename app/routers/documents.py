@@ -32,7 +32,10 @@ from app.core.security_middleware import sanitize_text
 
 router = APIRouter()
 
-DOCS_DIR = os.environ.get("DEALSHIELD_DOCS_DIR", "/home/debian/projects/deal_shield_backend/data/deal_docs")
+DOCS_DIR = os.environ.get(
+    "DEALSHIELD_DOCS_DIR",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "data", "deal_docs"),
+)
 WALKAWAY_MIN = 50_000.0
 WALKAWAY_RATE = 0.01
 WALKAWAY_CAP = 500_000.0
