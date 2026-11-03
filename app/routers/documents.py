@@ -120,7 +120,7 @@ def _render_watermarked_page(page_img: Image.Image, wm_text: str) -> bytes:
         x = -(row % 2) * (step_x // 2)
         while x < W + tw:
             # rotate text: draw on temp layer for slant
-            d.text((x, y), label, font=font, fill=(128, 128, 128, 45))
+            d.text((x, y), label, font=font, fill=(120, 120, 120, 75))
             x += step_x
         y += step_y
         row += 1
