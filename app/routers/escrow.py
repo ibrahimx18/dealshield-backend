@@ -653,9 +653,9 @@ def cancel_escrow(tx_id: int, request: Request,
         if docs_walkaway:
             # Docs deal + seller already delivered documents + BUYER cancels = bad-faith walkaway:
             # buyer forfeits the walkaway fee to the seller, remainder refunded.
-            fee = min(tx.walkaway_fee, tx.amount)
+            fee = min(float(tx.walkaway_fee or 0), float(tx.amount))
             tx.cancellation_fee = 0.0  # no ₦5k fee on walkaway; the forfeit replaces it
-            refundable = tx.amount + (tx.insurance_fee or 0) + (tx.buyer_gateway_share or 0) - fee
+            refundable = float(tx.amount) + float(tx.insurance_fee or 0) + float(tx.buyer_gateway_share or 0) - fee
             _refund_buyer(db, tx, partial_amount=max(refundable, 0))
             tx.commission = 0.0
             # credit the seller's wallet with the forfeited fee

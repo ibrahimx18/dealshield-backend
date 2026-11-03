@@ -59,8 +59,9 @@ def _log_audit(db, user_id, action, request, target_id=None, details=""):
     db.add(AuditLog(user_id=user_id, action=action, ip_address=ip, target_id=target_id, details=details))
 
 
-def _calc_walkaway_fee(amount: float) -> float:
-    return max(WALKAWAY_MIN, min(amount * WALKAWAY_RATE, WALKAWAY_CAP))
+def _calc_walkaway_fee(amount) -> float:
+    amt = float(amount)  # amounts may arrive as Decimal (NUMERIC column)
+    return max(WALKAWAY_MIN, min(amt * WALKAWAY_RATE, WALKAWAY_CAP))
 
 
 def _require_party(tx, user):
