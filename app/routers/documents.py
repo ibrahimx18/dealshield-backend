@@ -59,7 +59,8 @@ def _log_audit(db, user_id, action, request, target_id=None, details=""):
         ip = request.client.host if request.client else "unknown"
     except Exception:
         ip = "unknown"
-    db.add(AuditLog(user_id=user_id, action=action, ip_address=ip, target_id=target_id, details=details))
+    db.add(AuditLog(actor_id=user_id, action=action, target_type="escrow_transaction",
+                    target_id=target_id, ip_address=ip, details=details))
 
 
 def _calc_walkaway_fee(amount) -> float:
