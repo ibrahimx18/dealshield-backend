@@ -9,7 +9,7 @@ from slowapi.errors import RateLimitExceeded
 from app.core.security_middleware import SecurityHeadersMiddleware, HTTPSRedirectMiddleware, RateLimitMiddleware
 from app.core.database import Base, engine, SessionLocal
 import redis
-from app.routers import auth, listings, escrow, wallet, market, health, integrations, ai, reviews, payment_links, payments, dispatch, admin
+from app.routers import auth, listings, escrow, wallet, market, health, integrations, ai, reviews, payment_links, payments, dispatch, admin, documents
 
 # Load .env file into os.environ BEFORE secret validation
 load_dotenv()
@@ -171,6 +171,7 @@ app.include_router(health.router, tags=["health"])
 app.include_router(auth.router, prefix="/auth", tags=["auth"])
 app.include_router(listings.router, prefix="/listings", tags=["listings"])
 app.include_router(escrow.router, prefix="/escrow", tags=["escrow"])
+app.include_router(documents.router, prefix="/escrow", tags=["documents"])
 app.include_router(wallet.router, prefix="/wallet", tags=["wallet"])
 app.include_router(market.router, prefix="/market", tags=["market"])
 app.include_router(integrations.router, prefix="/api", tags=["integrations"])

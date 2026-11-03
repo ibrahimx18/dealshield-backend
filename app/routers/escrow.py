@@ -414,6 +414,14 @@ def fund_escrow(tx_id: int, request: Request,
     except HTTPException:
         db.rollback()
         raise
+
+    # Docs deals (land/property): set the seller's document deadline at funding time
+    from app.routers.documents import _is_docs_deal, _calc_walkaway_fee, DOCS_DEADLINE_DAYS
+    if _is_docs_deal(tx) and not tx.docs_deadline:
+        tx.docs_deadline = now + timedelta(days=DOCS_DEADLINE_DAYS)
+        tx.walkaway_fee = _calc_walkaway_fee(tx.amount)
+    db.flush()
+
     db.add(WalletTx(
         user_id=current_user.id, amount=-total_with_gateway, type="escrow_hold",
         description=f"Escrow deposit for {tx.listing_title}" + (", insured" if tx.insured else "")
@@ -637,10 +645,32 @@ def cancel_escrow(tx_id: int, request: Request,
 
     now = datetime.utcnow()
     was_funded = tx.status == "funded"
+    docs_walkaway = (was_funded and tx.docs_uploaded_at
+                     and tx.buyer_id == current_user.id and (tx.walkaway_fee or 0) > 0)
     # Claim the state change first so a racing release/fulfil cannot also act (B08)
     _transition(db, tx, {"status": "cancelled", "closed_at": now})
     if was_funded:
-        _refund_buyer(db, tx)
+        if docs_walkaway:
+            # Docs deal + seller already delivered documents + BUYER cancels = bad-faith walkaway:
+            # buyer forfeits the walkaway fee to the seller, remainder refunded.
+            fee = min(tx.walkaway_fee, tx.amount)
+            tx.cancellation_fee = 0.0  # no ₦5k fee on walkaway; the forfeit replaces it
+            refundable = tx.amount + (tx.insurance_fee or 0) + (tx.buyer_gateway_share or 0) - fee
+            _refund_buyer(db, tx, partial_amount=max(refundable, 0))
+            tx.commission = 0.0
+            # credit the seller's wallet with the forfeited fee
+            seller = db.query(User).get(tx.seller_id)
+            if seller is not None:
+                seller.wallet_balance = (seller.wallet_balance or 0) + fee
+            db.add(WalletTx(
+                user_id=tx.seller_id, amount=fee, type="walkaway_fee",
+                description=f"Buyer walkaway fee on deal #{tx.id} (documents were delivered)"
+            ))
+            tx.admin_resolution = "buyer_walkaway_forfeit"
+            tx.admin_reason = ("Buyer cancelled after seller delivered ownership documents. "
+                               f"Forfeit ₦{fee:,.0f} to seller; remainder refunded.")
+        else:
+            _refund_buyer(db, tx)
 
     _log_audit(db, current_user.id, "escrow_cancel", request, target_id=tx.id)
     db.commit()

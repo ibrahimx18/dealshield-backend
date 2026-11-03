@@ -179,6 +179,25 @@ class EscrowTransaction(Base):
     release_otp_expiry = Column(DateTime, nullable=True)  # OTP validity window
     # ── Shareable deal link ──
     share_token = Column(String, default="")              # unique token for shareable deal link
+    # ── Document room (land/property deals) ──
+    docs_deadline = Column(DateTime, nullable=True)        # seller must upload ownership docs by this time
+    docs_uploaded_at = Column(DateTime, nullable=True)     # when seller completed doc upload
+    walkaway_fee = Column(Float, default=0.0)             # forfeited by bad-faith buyer walkaway
+
+
+class DealDocument(Base):
+    """Seller-uploaded ownership documents for a deal's document room.
+    View-only for the buyer: served as watermarked images, never as raw files."""
+    __tablename__ = "deal_documents"
+    id = Column(Integer, primary_key=True, index=True)
+    tx_id = Column(Integer, ForeignKey("escrow_transactions.id"), nullable=False, index=True)
+    uploader_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    filename = Column(String, default="")                 # original filename (internal only)
+    storage_path = Column(String, nullable=False)          # encrypted file path on disk
+    file_type = Column(String, default="pdf")              # pdf | image
+    page_count = Column(Integer, default=1)
+    uploaded_at = Column(DateTime, default=datetime.utcnow)
+    note = Column(String, default="")                       # seller's caption, e.g. "C of O"
 
 
 class WalletTx(Base):
