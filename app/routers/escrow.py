@@ -53,6 +53,9 @@ router = APIRouter()
 
 # Insurance fee: 1.5% of item value
 INSURANCE_RATE = Decimal("0.015")
+# DealShield's share of a buyer walkaway forfeit (docs deals): 20%, capped at ₦100,000
+WALKAWAY_DS_SHARE = 0.20
+WALKAWAY_DS_CAP = 100_000.0
 # Gateway fee: 1.5% of total (Paystack/Flutterwave standard), capped at ₦50,000
 GATEWAY_FEE_RATE = Decimal("0.015")
 GATEWAY_FEE_CAP = Decimal("50000.00")
@@ -652,23 +655,31 @@ def cancel_escrow(tx_id: int, request: Request,
     if was_funded:
         if docs_walkaway:
             # Docs deal + seller already delivered documents + BUYER cancels = bad-faith walkaway:
-            # buyer forfeits the walkaway fee to the seller, remainder refunded.
+            # buyer forfeits the walkaway fee; seller keeps 80%, DealShield takes 20% (capped).
             fee = min(float(tx.walkaway_fee or 0), float(tx.amount))
+            ds_cut = min(fee * WALKAWAY_DS_SHARE, WALKAWAY_DS_CAP)  # DealShield's share
+            seller_gets = fee - ds_cut
             tx.cancellation_fee = 0.0  # no ₦5k fee on walkaway; the forfeit replaces it
             refundable = float(tx.amount) + float(tx.insurance_fee or 0) + float(tx.buyer_gateway_share or 0) - fee
             _refund_buyer(db, tx, partial_amount=max(refundable, 0))
             tx.commission = 0.0
-            # credit the seller's wallet with the forfeited fee
+            # credit the seller's wallet with their share of the forfeited fee
             seller = db.query(User).get(tx.seller_id)
             if seller is not None:
-                seller.wallet_balance = float(seller.wallet_balance or 0) + fee
+                seller.wallet_balance = float(seller.wallet_balance or 0) + seller_gets
+            if ds_cut > 0:
+                db.add(WalletTx(
+                    user_id=tx.seller_id, amount=-ds_cut, type="walkaway_fee_share",
+                    description=f"DealShield 20% admin share of walkaway fee on deal #{tx.id}"
+                ))
             db.add(WalletTx(
-                user_id=tx.seller_id, amount=fee, type="walkaway_fee",
+                user_id=tx.seller_id, amount=seller_gets, type="walkaway_fee",
                 description=f"Buyer walkaway fee on deal #{tx.id} (documents were delivered)"
             ))
+            tx.dealshield_cut = (tx.dealshield_cut or 0) + ds_cut
             tx.admin_resolution = "buyer_walkaway_forfeit"
             tx.admin_reason = ("Buyer cancelled after seller delivered ownership documents. "
-                               f"Forfeit ₦{fee:,.0f} to seller; remainder refunded.")
+                               f"Forfeit ₦{fee:,.0f} — seller ₦{seller_gets:,.0f}, DealShield ₦{ds_cut:,.0f}.")
         else:
             _refund_buyer(db, tx)
 
