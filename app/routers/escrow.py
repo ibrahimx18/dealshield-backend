@@ -661,7 +661,7 @@ def cancel_escrow(tx_id: int, request: Request,
             # credit the seller's wallet with the forfeited fee
             seller = db.query(User).get(tx.seller_id)
             if seller is not None:
-                seller.wallet_balance = (seller.wallet_balance or 0) + fee
+                seller.wallet_balance = float(seller.wallet_balance or 0) + fee
             db.add(WalletTx(
                 user_id=tx.seller_id, amount=fee, type="walkaway_fee",
                 description=f"Buyer walkaway fee on deal #{tx.id} (documents were delivered)"
