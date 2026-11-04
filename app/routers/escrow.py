@@ -676,7 +676,7 @@ def cancel_escrow(tx_id: int, request: Request,
                 user_id=tx.seller_id, amount=seller_gets, type="walkaway_fee",
                 description=f"Buyer walkaway fee on deal #{tx.id} (documents were delivered)"
             ))
-            tx.dealshield_cut = (tx.dealshield_cut or 0) + ds_cut
+            tx.dealshield_cut = float(tx.dealshield_cut or 0) + ds_cut
             tx.admin_resolution = "buyer_walkaway_forfeit"
             tx.admin_reason = ("Buyer cancelled after seller delivered ownership documents. "
                                f"Forfeit ₦{fee:,.0f} — seller ₦{seller_gets:,.0f}, DealShield ₦{ds_cut:,.0f}.")
