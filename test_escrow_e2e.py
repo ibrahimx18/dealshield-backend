@@ -47,7 +47,17 @@ for role in ["buyer", "seller", "facilitator"]:
         log(f"Token verify {role}", True)
     else:
         log(f"Token verify {role}", False, f"{r.status_code}: {r.text[:200]}")
-        sys.exit(1)
+
+# ── 2b. KYC: mandatory before listings/escrow (auth rate limit: pause first) ─
+time.sleep(65)
+for role in ["buyer", "seller", "facilitator"]:
+    r = S.post(f"{BASE}/auth/kyc/submit", headers=auth(role), json={
+        "id_type": "nin",
+        "id_number": "12345678901",
+        "phone": users[role].get("phone", "08030000000"),
+    })
+    log(f"KYC {role}", r.status_code in (200, 201), f"{r.status_code}: {r.text[:200]}")
+    time.sleep(2)  # avoid rate limiter
 
 # ── 3. Fund wallets via DB (update users.wallet_balance) ─────────────────
 url_re = re.search(r'DATABASE_URL=postgresql://(\w+):(.*)@(\w+):(\d+)/(\w+)', open('.env').read())
@@ -60,6 +70,9 @@ seller_id = users["seller"]["user_id"]
 
 cur.execute("UPDATE users SET wallet_balance = 10000000.0 WHERE id = %s", (buyer_id,))
 cur.execute("UPDATE users SET wallet_balance = 2000000.0 WHERE id = %s", (seller_id,))
+# KYC fails closed (pending until admin/provider decision) — verify test users directly
+cur.execute("UPDATE users SET kyc_status = 'verified', kyc_verified = true WHERE id = ANY(%s)",
+            ([users[r]["user_id"] for r in ("buyer", "seller", "facilitator")],))
 conn.commit()
 conn.close()
 log("Fund wallets (DB)", True, f"buyer={buyer_id} ₦10M, seller={seller_id} ₦2M")
@@ -70,7 +83,7 @@ for role in ["buyer", "seller"]:
     if r.status_code == 200:
         bal = r.json().get("balance", 0)
         users[role]["balance"] = bal
-        log(f"Wallet {role}", True, f"balance={bal:,.0f}")
+        log(f"Wallet {role}", True, f"balance={float(str(bal)):,.0f}")
     else:
         log(f"Wallet {role}", False, f"{r.status_code}: {r.text[:200]}")
 
@@ -157,8 +170,8 @@ else:
 # ── 14. Seller wallet after payout ──────────────────────────────────────
 r = S.get(f"{BASE}/wallet/balance", headers=auth("seller"))
 if r.status_code == 200:
-    seller_final = r.json().get("balance", 0)
-    # Seller started with 2M, should get ~8.5M minus commission minus gateway share
+    seller_final = float(str(r.json().get("balance", 0)))
+
     log("Seller paid", seller_final > 2000000, f"balance={seller_final:,.0f} (was ₦2M)")
 else:
     log("Seller paid", False, f"{r.status_code}: {r.text[:200]}")
@@ -166,8 +179,8 @@ else:
 # ── 15. Buyer wallet after escrow ───────────────────────────────────────
 r = S.get(f"{BASE}/wallet/balance", headers=auth("buyer"))
 if r.status_code == 200:
-    buyer_final = r.json().get("balance", 0)
-    # Buyer started with 10M, paid 8.5M + gateway share
+    buyer_final = float(str(r.json().get("balance", 0)))
+
     log("Buyer remaining", buyer_final < 10000000, f"balance={buyer_final:,.0f} (was ₦10M)")
 else:
     log("Buyer remaining", False, f"{r.status_code}: {r.text[:200]}")
