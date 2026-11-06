@@ -192,6 +192,10 @@ class EscrowOut(BaseModel):
     buyer_gateway_share: Decimal = Decimal("0.00")
     seller_gateway_share: Decimal = Decimal("0.00")
     cancellation_fee: Decimal = Decimal("0.00")
+    # Document-room fields
+    docs_deadline: Optional[datetime] = None
+    docs_uploaded_at: Optional[datetime] = None
+    walkaway_fee: Decimal = Decimal("0.00")
     # Release OTP
     release_otp: Optional[str] = None
     release_otp_expiry: Optional[datetime] = None
